@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -61,6 +62,17 @@ enum LarkPlatform {
     Feishu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkAttachmentKind {
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LarkAttachment {
+    kind: LarkAttachmentKind,
+    target: String,
+}
+
 impl LarkPlatform {
     fn api_base(self) -> &'static str {
         match self {
@@ -96,6 +108,138 @@ impl LarkPlatform {
             Self::Feishu => "feishu",
         }
     }
+}
+
+impl LarkAttachmentKind {
+    fn from_marker(marker: &str) -> Option<Self> {
+        match marker.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" => Some(Self::Image),
+            _ => None,
+        }
+    }
+}
+
+fn infer_lark_attachment_kind_from_target(target: &str) -> Option<LarkAttachmentKind> {
+    let normalized = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .split('#')
+        .next()
+        .unwrap_or(target);
+
+    let extension = Path::new(normalized)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(LarkAttachmentKind::Image),
+        _ => None,
+    }
+}
+
+fn parse_lark_path_only_attachment(message: &str) -> Option<LarkAttachment> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+
+    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    if candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+    let kind = infer_lark_attachment_kind_from_target(candidate)?;
+
+    if !Path::new(candidate).exists() {
+        return None;
+    }
+
+    Some(LarkAttachment {
+        kind,
+        target: candidate.to_string(),
+    })
+}
+
+fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let marker_text = &message[start + 1..end];
+
+        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
+            let kind = LarkAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(LarkAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+fn classify_lark_outgoing_attachments(attachments: &[LarkAttachment]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut local_images = Vec::new();
+    let mut unresolved_markers = Vec::new();
+
+    for attachment in attachments {
+        let target = attachment.target.trim();
+        let path = Path::new(target);
+        if path.exists() && path.is_file() {
+            local_images.push(path.to_path_buf());
+            continue;
+        }
+
+        unresolved_markers.push(format!("[IMAGE:{target}]"));
+    }
+
+    (local_images, unresolved_markers)
+}
+
+fn build_lark_text_message_body(recipient: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "text",
+        "content": serde_json::json!({ "text": content }).to_string(),
+    })
+}
+
+fn build_lark_image_message_body(recipient: &str, image_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "image",
+        "content": serde_json::json!({ "image_key": image_key }).to_string(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -427,6 +571,10 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn upload_image_url(&self) -> String {
+        format!("{}/im/v1/images", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -997,6 +1145,99 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    async fn upload_image_once(
+        &self,
+        token: &str,
+        image_path: &Path,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let image_bytes = tokio::fs::read(image_path).await?;
+        let file_name = image_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+        let mime = mime_guess::from_path(image_path).first_or_octet_stream();
+        let image_part = reqwest::multipart::Part::bytes(image_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(mime.as_ref())?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", image_part);
+
+        let resp = self
+            .http_client()
+            .post(self.upload_image_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    async fn upload_image_with_retry(&self, image_path: &Path) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self.upload_image_once(&token, image_path).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let refreshed_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.upload_image_once(&refreshed_token, image_path).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark image upload failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, "image upload after token refresh")?;
+            return retry_response
+                .pointer("/data/image_key")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow::anyhow!("missing image_key in Lark image upload response"));
+        }
+
+        ensure_lark_send_success(status, &response, "image upload without token refresh")?;
+        response
+            .pointer("/data/image_key")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("missing image_key in Lark image upload response"))
+    }
+
+    async fn send_json_message(&self, body: &serde_json::Value) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+        let (status, response) = self.send_text_once(&url, &token, body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self.send_text_once(&url, &new_token, body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            return Ok(());
+        }
+
+        ensure_lark_send_success(status, &response, "without token refresh")?;
+        Ok(())
+    }
+
+    async fn send_text_message(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+        let body = build_lark_text_message_body(recipient, content);
+        self.send_json_message(&body).await
+    }
+
     /// Parse an event callback payload and extract text messages
     pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
@@ -1131,37 +1372,49 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let raw_content = super::strip_tool_call_tags(&message.content);
+        let (cleaned_content, parsed_attachments) = parse_lark_attachment_markers(&raw_content);
+        let (local_images, unresolved_markers) =
+            classify_lark_outgoing_attachments(&parsed_attachments);
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
+        if !unresolved_markers.is_empty() {
+            tracing::warn!(
+                unresolved = ?unresolved_markers,
+                "lark: unresolved image attachment markers were sent as plain text"
+            );
+        }
 
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let mut text_segments = Vec::new();
+        if !cleaned_content.is_empty() {
+            text_segments.push(cleaned_content);
+        }
+        if !unresolved_markers.is_empty() {
+            text_segments.extend(unresolved_markers);
+        }
 
-        if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
-
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
+        if !local_images.is_empty() {
+            if !text_segments.is_empty() {
+                self.send_text_message(&message.recipient, &text_segments.join("\n"))
+                    .await?;
             }
 
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            for image_path in &local_images {
+                let image_key = self.upload_image_with_retry(image_path).await?;
+                let body = build_lark_image_message_body(&message.recipient, &image_key);
+                self.send_json_message(&body).await?;
+            }
             return Ok(());
         }
 
-        ensure_lark_send_success(status, &response, "without token refresh")?;
-        Ok(())
+        if let Some(attachment) = parse_lark_path_only_attachment(&raw_content) {
+            let image_key = self
+                .upload_image_with_retry(Path::new(&attachment.target))
+                .await?;
+            let body = build_lark_image_message_body(&message.recipient, &image_key);
+            return self.send_json_message(&body).await;
+        }
+
+        self.send_text_message(&message.recipient, &raw_content).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -1628,6 +1881,7 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
@@ -1892,6 +2146,42 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload);
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn lark_parse_attachment_markers_extracts_local_images() {
+        let (cleaned, attachments) =
+            parse_lark_attachment_markers("先看图 [IMAGE:/tmp/snap.png] 然后回复");
+
+        assert_eq!(cleaned, "先看图  然后回复");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, LarkAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/snap.png");
+    }
+
+    #[test]
+    fn lark_parse_path_only_attachment_detects_image_file() {
+        let dir = TempDir::new().unwrap();
+        let image_path = dir.path().join("screen.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        let parsed = parse_lark_path_only_attachment(image_path.to_string_lossy().as_ref())
+            .expect("expected image attachment");
+
+        assert_eq!(parsed.kind, LarkAttachmentKind::Image);
+        assert_eq!(parsed.target, image_path.to_string_lossy());
+    }
+
+    #[test]
+    fn lark_build_image_message_body_uses_image_key() {
+        let body = build_lark_image_message_body("oc_chat123", "img_v3_key");
+
+        assert_eq!(body["receive_id"], "oc_chat123");
+        assert_eq!(body["msg_type"], "image");
+        assert_eq!(
+            body["content"],
+            serde_json::json!({ "image_key": "img_v3_key" }).to_string()
+        );
     }
 
     #[test]
