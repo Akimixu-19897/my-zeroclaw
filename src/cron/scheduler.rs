@@ -1,6 +1,8 @@
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -363,6 +365,26 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        #[cfg(feature = "channel-lark")]
+        "lark" => {
+            let lk = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            let channel = LarkChannel::from_lark_config(lk);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(feature = "channel-lark")]
+        "feishu" => {
+            let fs = config
+                .channels_config
+                .feishu
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
+            let channel = LarkChannel::from_feishu_config(fs);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
@@ -465,6 +487,8 @@ async fn run_job_command_with_timeout(
 mod tests {
     use super::*;
     use crate::config::Config;
+    #[cfg(feature = "channel-lark")]
+    use crate::config::schema::LarkReceiveMode;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -1010,5 +1034,30 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[tokio::test]
+    async fn deliver_announcement_accepts_feishu_channel() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "cli_test".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+
+        let err = deliver_announcement(&config, "feishu", "oc_test_target", "hello")
+            .await
+            .unwrap_err();
+
+        assert!(
+            !err.to_string().contains("unsupported delivery channel"),
+            "feishu should be recognized by cron delivery dispatch"
+        );
     }
 }

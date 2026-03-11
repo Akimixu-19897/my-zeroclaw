@@ -312,6 +312,20 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "lark" => {
+            if config.channels_config.lark.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to lark but channels_config.lark is not configured"
+                );
+            }
+        }
+        "feishu" => {
+            if config.channels_config.feishu.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to feishu but channels_config.feishu is not configured"
+                );
+            }
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
@@ -329,6 +343,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::LarkReceiveMode;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -540,5 +555,27 @@ mod tests {
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_feishu_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("feishu".into());
+        config.heartbeat.to = Some("oc_test_target".into());
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "cli_test".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("feishu".to_string(), "oc_test_target".to_string()))
+        );
     }
 }
