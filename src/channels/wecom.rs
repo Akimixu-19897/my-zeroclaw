@@ -39,17 +39,25 @@ struct WeComSubscribeBody {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct WeComTextBody {
+struct WeComReplyStreamBody {
     msgtype: &'static str,
-    text: WeComTextContent,
+    stream: WeComStreamContent,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct WeComSendTextBody {
+struct WeComStreamContent {
+    id: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    finish: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    content: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct WeComSendMarkdownBody {
     chatid: String,
-    chat_type: i32,
     msgtype: &'static str,
-    text: WeComTextContent,
+    markdown: WeComTextContent,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -63,6 +71,7 @@ struct WeComInboundFrame {
     headers: Option<WeComHeaders>,
     body: Option<WeComInboundBody>,
     errcode: Option<i32>,
+    errmsg: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +95,7 @@ struct WeComInboundText {
 }
 
 pub struct WeComChannel {
+    name: String,
     bot_id: String,
     secret: String,
     websocket_url: String,
@@ -96,6 +106,7 @@ pub struct WeComChannel {
 
 impl WeComChannel {
     pub fn new(
+        name: String,
         bot_id: String,
         secret: String,
         websocket_url: String,
@@ -103,6 +114,7 @@ impl WeComChannel {
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         Self {
+            name,
             bot_id,
             secret,
             websocket_url,
@@ -113,7 +125,12 @@ impl WeComChannel {
     }
 
     pub fn from_config(config: &crate::config::schema::WeComConfig) -> Self {
+        Self::from_named_config("wecom".to_string(), config)
+    }
+
+    pub fn from_named_config(name: String, config: &crate::config::schema::WeComConfig) -> Self {
         Self::new(
+            name,
             config.bot_id.clone(),
             config.secret.clone(),
             config.websocket_url.clone(),
@@ -144,20 +161,18 @@ impl WeComChannel {
         }
     }
 
-    fn build_send_frame(
-        content: &str,
-        recipient: &str,
-        thread_ts: Option<&str>,
-    ) -> Result<String> {
+    fn build_send_frame(content: &str, recipient: &str, thread_ts: Option<&str>) -> Result<String> {
         if let Some(req_id) = thread_ts {
             let frame = WeComOutboundFrame {
                 cmd: "aibot_respond_msg".to_string(),
                 headers: WeComHeaders {
                     req_id: req_id.to_string(),
                 },
-                body: Some(WeComTextBody {
-                    msgtype: "text",
-                    text: WeComTextContent {
+                body: Some(WeComReplyStreamBody {
+                    msgtype: "stream",
+                    stream: WeComStreamContent {
+                        id: req_id.to_string(),
+                        finish: true,
                         content: content.to_string(),
                     },
                 }),
@@ -168,17 +183,17 @@ impl WeComChannel {
         let target = Self::parse_recipient_target(recipient)?;
         let chat_id = target
             .chat_id
+            .or(target.user_id)
             .ok_or_else(|| anyhow::anyhow!("WeCom proactive send requires a chat target"))?;
         let frame = WeComOutboundFrame {
             cmd: "aibot_send_msg".to_string(),
             headers: WeComHeaders {
                 req_id: new_req_id(),
             },
-            body: Some(WeComSendTextBody {
+            body: Some(WeComSendMarkdownBody {
                 chatid: chat_id,
-                chat_type: target.chat_type.unwrap_or(1),
-                msgtype: "text",
-                text: WeComTextContent {
+                msgtype: "markdown",
+                markdown: WeComTextContent {
                     content: content.to_string(),
                 },
             }),
@@ -221,11 +236,15 @@ impl WeComChannel {
         })
     }
 
-    fn parse_inbound_message(frame: WeComInboundFrame) -> Option<ChannelMessage> {
+    fn parse_inbound_message(
+        frame: WeComInboundFrame,
+        channel_name: &str,
+    ) -> Option<ChannelMessage> {
         if frame.errcode.is_some() {
             return None;
         }
-        if frame.cmd.as_deref()? != "aibot_msg_callback" {
+        let cmd = frame.cmd.as_deref()?;
+        if cmd != "aibot_msg_callback" && cmd != "aibot_callback" {
             return None;
         }
 
@@ -247,7 +266,7 @@ impl WeComChannel {
             sender,
             reply_target,
             content,
-            channel: "wecom".to_string(),
+            channel: channel_name.to_string(),
             timestamp: current_timestamp_secs(),
             thread_ts: Some(headers.req_id),
         })
@@ -266,12 +285,15 @@ impl WeComChannel {
 #[async_trait]
 impl Channel for WeComChannel {
     fn name(&self) -> &str {
-        "wecom"
+        &self.name
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let payload =
-            Self::build_send_frame(&message.content, &message.recipient, message.thread_ts.as_deref())?;
+        let payload = Self::build_send_frame(
+            &message.content,
+            &message.recipient,
+            message.thread_ts.as_deref(),
+        )?;
         self.outbound_tx
             .send(payload)
             .map_err(|_| anyhow::anyhow!("WeCom outbound queue is closed"))?;
@@ -294,10 +316,8 @@ impl Channel for WeComChannel {
             let (mut write, mut read) = stream.split();
             tracing::info!("WeCom: websocket connected");
 
-            let subscribe = serde_json::to_string(&Self::build_subscribe_frame(
-                &self.bot_id,
-                &self.secret,
-            ))?;
+            let subscribe =
+                serde_json::to_string(&Self::build_subscribe_frame(&self.bot_id, &self.secret))?;
             write.send(WsMsg::Text(subscribe.into())).await?;
             tracing::info!("WeCom: subscribe frame sent");
 
@@ -324,12 +344,19 @@ impl Channel for WeComChannel {
                                 match serde_json::from_str::<WeComInboundFrame>(text.as_ref()) {
                                     Ok(frame) => {
                                         if frame.errcode == Some(0) {
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 "WeCom: received ack req_id={}",
                                                 frame.headers.as_ref().map(|h| h.req_id.as_str()).unwrap_or("")
                                             );
+                                        } else if let Some(errcode) = frame.errcode {
+                                            tracing::warn!(
+                                                "WeCom: received error errcode={} errmsg={} req_id={}",
+                                                errcode,
+                                                frame.errmsg.as_deref().unwrap_or(""),
+                                                frame.headers.as_ref().map(|h| h.req_id.as_str()).unwrap_or("")
+                                            );
                                         }
-                                        if let Some(message) = Self::parse_inbound_message(frame) {
+                                        if let Some(message) = Self::parse_inbound_message(frame, self.name()) {
                                             if !self.allows_sender(&message.sender) {
                                                 tracing::warn!("WeCom: ignoring {} (not in allowed_users)", message.sender);
                                                 continue;
@@ -345,7 +372,7 @@ impl Channel for WeComChannel {
                             Some(Ok(WsMsg::Binary(bytes))) => {
                                 if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                                     if let Ok(frame) = serde_json::from_str::<WeComInboundFrame>(&text) {
-                                        if let Some(message) = Self::parse_inbound_message(frame) {
+                                        if let Some(message) = Self::parse_inbound_message(frame, self.name()) {
                                             if !self.allows_sender(&message.sender) {
                                                 tracing::warn!("WeCom: ignoring {} (not in allowed_users)", message.sender);
                                                 continue;
@@ -411,7 +438,7 @@ mod tests {
     fn parse_inbound_group_text_message_uses_group_reply_target_and_req_id() {
         let frame: WeComInboundFrame = serde_json::from_str(
             r#"{
-              "cmd":"aibot_msg_callback",
+              "cmd":"aibot_callback",
               "headers":{"req_id":"req-123"},
               "body":{
                 "msgid":"msg-1",
@@ -425,7 +452,7 @@ mod tests {
         )
         .unwrap();
 
-        let message = WeComChannel::parse_inbound_message(frame).expect("parsed message");
+        let message = WeComChannel::parse_inbound_message(frame, "wecom").expect("parsed message");
         assert_eq!(message.id, "msg-1");
         assert_eq!(message.sender, "zhangsan");
         assert_eq!(message.reply_target, "group:chat-1");
@@ -440,8 +467,36 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["cmd"], "aibot_respond_msg");
         assert_eq!(value["headers"]["req_id"], "req-abc");
-        assert_eq!(value["body"]["msgtype"], "text");
-        assert_eq!(value["body"]["text"]["content"], "pong");
+        assert_eq!(value["body"]["msgtype"], "stream");
+        assert_eq!(value["body"]["stream"]["id"], "req-abc");
+        assert_eq!(value["body"]["stream"]["finish"], true);
+        assert_eq!(value["body"]["stream"]["content"], "pong");
+        assert!(value["body"].get("text").is_none());
+    }
+
+    #[test]
+    fn parse_inbound_message_supports_legacy_callback_cmd() {
+        let frame: WeComInboundFrame = serde_json::from_str(
+            r#"{
+              "cmd":"aibot_msg_callback",
+              "headers":{"req_id":"req-legacy"},
+              "body":{
+                "msgid":"msg-legacy",
+                "chatid":"chat-legacy",
+                "chattype":"group",
+                "from":{"userid":"lisi"},
+                "msgtype":"text",
+                "text":{"content":"legacy"}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let message =
+            WeComChannel::parse_inbound_message(frame, "wecom:ops").expect("parsed legacy message");
+        assert_eq!(message.id, "msg-legacy");
+        assert_eq!(message.channel, "wecom:ops");
+        assert_eq!(message.thread_ts.as_deref(), Some("req-legacy"));
     }
 
     #[test]
@@ -450,8 +505,18 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["cmd"], "aibot_send_msg");
         assert_eq!(value["body"]["chatid"], "chat-1");
-        assert_eq!(value["body"]["chat_type"], 2);
-        assert_eq!(value["body"]["text"]["content"], "pong");
+        assert_eq!(value["body"]["msgtype"], "markdown");
+        assert_eq!(value["body"]["markdown"]["content"], "pong");
+    }
+
+    #[test]
+    fn build_send_frame_uses_userid_as_chatid_for_proactive_direct_messages() {
+        let payload = WeComChannel::build_send_frame("pong", "user:alice", None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["cmd"], "aibot_send_msg");
+        assert_eq!(value["body"]["chatid"], "alice");
+        assert_eq!(value["body"]["msgtype"], "markdown");
+        assert_eq!(value["body"]["markdown"]["content"], "pong");
     }
 
     #[test]

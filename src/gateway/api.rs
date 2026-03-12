@@ -799,6 +799,17 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut feishu.encrypt_key);
         mask_optional_secret(&mut feishu.verification_token);
     }
+    for feishu in masked.channels_config.feishu_accounts.values_mut() {
+        mask_required_secret(&mut feishu.app_secret);
+        mask_optional_secret(&mut feishu.encrypt_key);
+        mask_optional_secret(&mut feishu.verification_token);
+    }
+    if let Some(wecom) = masked.channels_config.wecom.as_mut() {
+        mask_required_secret(&mut wecom.secret);
+    }
+    for wecom in masked.channels_config.wecom_accounts.values_mut() {
+        mask_required_secret(&mut wecom.secret);
+    }
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
     }
@@ -970,6 +981,27 @@ fn restore_masked_sensitive_fields(
             &current_ch.verification_token,
         );
     }
+    for (account, incoming_ch) in &mut incoming.channels_config.feishu_accounts {
+        if let Some(current_ch) = current.channels_config.feishu_accounts.get(account) {
+            restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
+            restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
+            restore_optional_secret(
+                &mut incoming_ch.verification_token,
+                &current_ch.verification_token,
+            );
+        }
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.wecom.as_mut(),
+        current.channels_config.wecom.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.secret, &current_ch.secret);
+    }
+    for (account, incoming_ch) in &mut incoming.channels_config.wecom_accounts {
+        if let Some(current_ch) = current.channels_config.wecom_accounts.get(account) {
+            restore_required_secret(&mut incoming_ch.secret, &current_ch.secret);
+        }
+    }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.dingtalk.as_mut(),
         current.channels_config.dingtalk.as_ref(),
@@ -1043,6 +1075,33 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });
+        cfg.channels_config.feishu_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::FeishuConfig {
+                app_id: "cli_ops".to_string(),
+                app_secret: "feishu-secret-ops".to_string(),
+                encrypt_key: Some("feishu-encrypt-ops".to_string()),
+                verification_token: Some("feishu-verify-ops".to_string()),
+                allowed_users: vec!["*".to_string()],
+                receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+        cfg.channels_config.wecom = Some(crate::config::schema::WeComConfig {
+            bot_id: "aib_default".to_string(),
+            secret: "wecom-secret-default".to_string(),
+            websocket_url: "wss://openws.work.weixin.qq.com".to_string(),
+            allowed_users: vec!["*".to_string()],
+        });
+        cfg.channels_config.wecom_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::WeComConfig {
+                bot_id: "aib_ops".to_string(),
+                secret: "wecom-secret-ops".to_string(),
+                websocket_url: "wss://openws.work.weixin.qq.com".to_string(),
+                allowed_users: vec!["*".to_string()],
+            },
+        );
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
@@ -1123,6 +1182,46 @@ mod tests {
         );
         assert_eq!(
             parsed
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .map(|v| v.app_secret.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .and_then(|v| v.encrypt_key.as_deref()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .and_then(|v| v.verification_token.as_deref()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
+                .channels_config
+                .wecom
+                .as_ref()
+                .map(|v| v.secret.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
+                .channels_config
+                .wecom_accounts
+                .get("ops")
+                .map(|v| v.secret.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
                 .model_routes
                 .first()
                 .and_then(|v| v.api_key.as_deref()),
@@ -1176,6 +1275,33 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });
+        current.channels_config.feishu_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::FeishuConfig {
+                app_id: "cli_ops".to_string(),
+                app_secret: "feishu-secret-ops-real".to_string(),
+                encrypt_key: Some("feishu-encrypt-ops-real".to_string()),
+                verification_token: Some("feishu-verify-ops-real".to_string()),
+                allowed_users: vec!["*".to_string()],
+                receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+        current.channels_config.wecom = Some(crate::config::schema::WeComConfig {
+            bot_id: "aib_current".to_string(),
+            secret: "wecom-secret-real".to_string(),
+            websocket_url: "wss://openws.work.weixin.qq.com".to_string(),
+            allowed_users: vec!["*".to_string()],
+        });
+        current.channels_config.wecom_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::WeComConfig {
+                bot_id: "aib_ops".to_string(),
+                secret: "wecom-secret-ops-real".to_string(),
+                websocket_url: "wss://openws.work.weixin.qq.com".to_string(),
+                allowed_users: vec!["*".to_string()],
+            },
+        );
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
@@ -1239,6 +1365,17 @@ mod tests {
             feishu.app_secret = MASKED_SECRET.to_string();
             feishu.encrypt_key = Some(MASKED_SECRET.to_string());
             feishu.verification_token = Some("feishu-verify-new".to_string());
+        }
+        if let Some(feishu) = incoming.channels_config.feishu_accounts.get_mut("ops") {
+            feishu.app_secret = MASKED_SECRET.to_string();
+            feishu.encrypt_key = Some("feishu-encrypt-ops-new".to_string());
+            feishu.verification_token = Some(MASKED_SECRET.to_string());
+        }
+        if let Some(wecom) = incoming.channels_config.wecom.as_mut() {
+            wecom.secret = MASKED_SECRET.to_string();
+        }
+        if let Some(wecom) = incoming.channels_config.wecom_accounts.get_mut("ops") {
+            wecom.secret = MASKED_SECRET.to_string();
         }
         if let Some(email) = incoming.channels_config.email.as_mut() {
             email.password = MASKED_SECRET.to_string();
@@ -1311,6 +1448,46 @@ mod tests {
                 .as_ref()
                 .and_then(|v| v.verification_token.as_deref()),
             Some("feishu-verify-new")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .map(|v| v.app_secret.as_str()),
+            Some("feishu-secret-ops-real")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .and_then(|v| v.encrypt_key.as_deref()),
+            Some("feishu-encrypt-ops-new")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .feishu_accounts
+                .get("ops")
+                .and_then(|v| v.verification_token.as_deref()),
+            Some("feishu-verify-ops-real")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .wecom
+                .as_ref()
+                .map(|v| v.secret.as_str()),
+            Some("wecom-secret-real")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .wecom_accounts
+                .get("ops")
+                .map(|v| v.secret.as_str()),
+            Some("wecom-secret-ops-real")
         );
         assert_eq!(
             hydrated.model_routes[0].api_key.as_deref(),

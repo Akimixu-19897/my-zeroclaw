@@ -76,7 +76,8 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
+- This fork enables `channel-lark` by default, so Feishu works out of the box.
+- Matrix is still optional and requires `channel-matrix`.
 - Typical local check with only hardware support:
 
 ```bash
@@ -330,14 +331,47 @@ verification_token = ""             # optional
 allowed_users = ["*"]
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
+
+[channels_config.feishu_accounts.ops]
+app_id = "cli_ops"
+app_secret = "xxx"
+allowed_users = ["*"]
+receive_mode = "websocket"
 ```
 
 Migration note:
 
 - Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
 - Prefer `[channels_config.feishu]` for new setups.
+- Named accounts under `[channels_config.feishu_accounts.<name>]` are exposed at runtime as `feishu:<name>`.
+- For cron delivery, use `channel = "feishu"` plus `account = "<name>"`.
 
-### 4.13 Nostr
+### 4.13 WeCom
+
+```toml
+[channels_config.wecom]
+bot_id = "aib_xxx"
+secret = "xxx"
+websocket_url = "wss://openws.work.weixin.qq.com"  # optional: defaults to official endpoint
+allowed_users = ["*"]
+
+[channels_config.wecom_accounts.ops]
+bot_id = "aib_ops"
+secret = "xxx"
+websocket_url = "wss://openws.work.weixin.qq.com"
+allowed_users = ["*"]
+```
+
+Notes:
+
+- WeCom here means the Enterprise WeChat intelligent bot in long-connection mode.
+- Create the bot in long-connection mode to obtain `Bot ID` and `Secret`.
+- `allowed_users = []` means deny all; `"*"` allows all.
+- Feishu and WeCom may both be configured in the same `config.toml`.
+- Named accounts under `[channels_config.wecom_accounts.<name>]` are exposed at runtime as `wecom:<name>`.
+- For cron delivery, use `channel = "wecom"`, optionally set `account = "<name>"`, and target `to = "user:<userid>"` or `to = "group:<chatid>"`.
+
+### 4.14 Nostr
 
 ```toml
 [channels_config.nostr]
@@ -369,7 +403,7 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
-### 4.14 DingTalk
+### 4.15 DingTalk
 
 ```toml
 [channels_config.dingtalk]

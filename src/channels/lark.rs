@@ -434,6 +434,7 @@ fn ensure_lark_send_success(
 /// - **`webhook`**: HTTP callback server; requires a public HTTPS endpoint.
 #[derive(Clone)]
 pub struct LarkChannel {
+    name_override: Option<String>,
     app_id: String,
     app_secret: String,
     verification_token: String,
@@ -483,6 +484,7 @@ impl LarkChannel {
         platform: LarkPlatform,
     ) -> Self {
         Self {
+            name_override: None,
             app_id,
             app_secret,
             verification_token,
@@ -547,12 +549,23 @@ impl LarkChannel {
         ch
     }
 
+    pub fn from_named_feishu_config(
+        name: String,
+        config: &crate::config::schema::FeishuConfig,
+    ) -> Self {
+        let mut ch = Self::from_feishu_config(config);
+        ch.name_override = Some(name);
+        ch
+    }
+
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client(self.platform.proxy_service_key())
     }
 
-    fn channel_name(&self) -> &'static str {
-        self.platform.channel_name()
+    fn channel_name(&self) -> &str {
+        self.name_override
+            .as_deref()
+            .unwrap_or_else(|| self.platform.channel_name())
     }
 
     fn api_base(&self) -> &'static str {

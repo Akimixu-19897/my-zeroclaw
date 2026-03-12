@@ -2,6 +2,7 @@
 use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    WeComChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -293,17 +294,19 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .channel
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
+    let account = delivery.account.as_deref();
     let target = delivery
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    deliver_announcement(config, channel, target, output).await
+    deliver_announcement(config, channel, account, target, output).await
 }
 
 pub(crate) async fn deliver_announcement(
     config: &Config,
     channel: &str,
+    account: Option<&str>,
     target: &str,
     output: &str,
 ) -> Result<()> {
@@ -380,18 +383,96 @@ pub(crate) async fn deliver_announcement(
         }
         #[cfg(feature = "channel-lark")]
         "feishu" => {
-            let fs = config
-                .channels_config
-                .feishu
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
-            let channel = LarkChannel::from_feishu_config(fs);
+            let (channel_name, fs) = resolve_feishu_delivery_account(config, account)?;
+            let channel = LarkChannel::from_named_feishu_config(channel_name, fs);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "wecom" => {
+            let (channel_name, wc) = resolve_wecom_delivery_account(config, account)?;
+            let channel = WeComChannel::from_named_config(channel_name, wc);
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
     Ok(())
+}
+
+fn resolve_wecom_delivery_account<'a>(
+    config: &'a Config,
+    account: Option<&str>,
+) -> Result<(String, &'a crate::config::schema::WeComConfig)> {
+    if let Some(account_id) = account {
+        let trimmed = account_id.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("delivery.account for wecom cannot be empty");
+        }
+        let cfg = config
+            .channels_config
+            .wecom_accounts
+            .get(trimmed)
+            .ok_or_else(|| anyhow::anyhow!("wecom account not configured: {trimmed}"))?;
+        return Ok((format!("wecom:{trimmed}"), cfg));
+    }
+
+    if let Some(cfg) = config.channels_config.wecom.as_ref() {
+        return Ok(("wecom".to_string(), cfg));
+    }
+
+    match config.channels_config.wecom_accounts.len() {
+        0 => anyhow::bail!("wecom channel not configured"),
+        1 => {
+            let (account_id, cfg) = config
+                .channels_config
+                .wecom_accounts
+                .iter()
+                .next()
+                .expect("single entry must exist");
+            Ok((format!("wecom:{account_id}"), cfg))
+        }
+        _ => {
+            anyhow::bail!("multiple wecom accounts configured; set delivery.account to choose one")
+        }
+    }
+}
+
+#[cfg(feature = "channel-lark")]
+fn resolve_feishu_delivery_account<'a>(
+    config: &'a Config,
+    account: Option<&str>,
+) -> Result<(String, &'a crate::config::schema::FeishuConfig)> {
+    if let Some(account_id) = account {
+        let trimmed = account_id.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("delivery.account for feishu cannot be empty");
+        }
+        let cfg = config
+            .channels_config
+            .feishu_accounts
+            .get(trimmed)
+            .ok_or_else(|| anyhow::anyhow!("feishu account not configured: {trimmed}"))?;
+        return Ok((format!("feishu:{trimmed}"), cfg));
+    }
+
+    if let Some(cfg) = config.channels_config.feishu.as_ref() {
+        return Ok(("feishu".to_string(), cfg));
+    }
+
+    match config.channels_config.feishu_accounts.len() {
+        0 => anyhow::bail!("feishu channel not configured"),
+        1 => {
+            let (account_id, cfg) = config
+                .channels_config
+                .feishu_accounts
+                .iter()
+                .next()
+                .expect("single entry must exist");
+            Ok((format!("feishu:{account_id}"), cfg))
+        }
+        _ => {
+            anyhow::bail!("multiple feishu accounts configured; set delivery.account to choose one")
+        }
+    }
 }
 
 async fn run_job_command(
@@ -491,6 +572,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "channel-lark")]
     use crate::config::schema::LarkReceiveMode;
+    use crate::config::schema::WeComConfig;
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
@@ -934,6 +1016,7 @@ mod tests {
             Some(DeliveryConfig {
                 mode: "announce".into(),
                 channel: Some("telegram".into()),
+                account: None,
                 to: Some("123456".into()),
                 best_effort: false,
             }),
@@ -972,6 +1055,7 @@ mod tests {
             Some(DeliveryConfig {
                 mode: "announce".into(),
                 channel: Some("telegram".into()),
+                account: None,
                 to: Some("123456".into()),
                 best_effort: true,
             }),
@@ -1032,6 +1116,7 @@ mod tests {
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
             channel: Some("invalid".into()),
+            account: None,
             to: Some("target".into()),
             best_effort: true,
         };
@@ -1054,7 +1139,7 @@ mod tests {
             port: None,
         });
 
-        let err = deliver_announcement(&config, "feishu", "oc_test_target", "hello")
+        let err = deliver_announcement(&config, "feishu", None, "oc_test_target", "hello")
             .await
             .unwrap_err();
 
@@ -1062,5 +1147,131 @@ mod tests {
             !err.to_string().contains("unsupported delivery channel"),
             "feishu should be recognized by cron delivery dispatch"
         );
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[tokio::test]
+    async fn deliver_announcement_accepts_named_feishu_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.feishu_accounts.insert(
+            "ops".into(),
+            crate::config::schema::FeishuConfig {
+                app_id: "cli_test".into(),
+                app_secret: "secret".into(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let err = deliver_announcement(&config, "feishu", Some("ops"), "oc_test_target", "hello")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("unsupported delivery channel"));
+        assert!(!text.contains("multiple feishu accounts configured"));
+        assert!(!text.contains("feishu account not configured"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[tokio::test]
+    async fn deliver_announcement_requires_account_when_multiple_feishu_accounts_exist() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        for account in ["ops", "sales"] {
+            config.channels_config.feishu_accounts.insert(
+                account.into(),
+                crate::config::schema::FeishuConfig {
+                    app_id: format!("cli_{account}"),
+                    app_secret: "secret".into(),
+                    encrypt_key: None,
+                    verification_token: None,
+                    allowed_users: vec!["*".into()],
+                    receive_mode: LarkReceiveMode::Websocket,
+                    port: None,
+                },
+            );
+        }
+
+        let err = deliver_announcement(&config, "feishu", None, "oc_test_target", "hello")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("multiple feishu accounts configured"));
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_accepts_wecom_channel() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.wecom = Some(WeComConfig {
+            bot_id: "aib_test".into(),
+            secret: "secret".into(),
+            websocket_url: "ws://127.0.0.1:9".into(),
+            allowed_users: vec!["*".into()],
+        });
+
+        assert!(
+            deliver_announcement(&config, "wecom", None, "user:alice", "hello")
+                .await
+                .is_ok(),
+            "wecom should be recognized by cron delivery dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_accepts_named_wecom_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.wecom_accounts.insert(
+            "ops".into(),
+            WeComConfig {
+                bot_id: "aib_ops".into(),
+                secret: "secret".into(),
+                websocket_url: "ws://127.0.0.1:9".into(),
+                allowed_users: vec!["*".into()],
+            },
+        );
+
+        assert!(
+            deliver_announcement(&config, "wecom", Some("ops"), "group:chat-ops", "hello")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_requires_account_when_multiple_wecom_accounts_exist() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.wecom_accounts.insert(
+            "ops".into(),
+            WeComConfig {
+                bot_id: "aib_ops".into(),
+                secret: "secret".into(),
+                websocket_url: "ws://127.0.0.1:9".into(),
+                allowed_users: vec!["*".into()],
+            },
+        );
+        config.channels_config.wecom_accounts.insert(
+            "sales".into(),
+            WeComConfig {
+                bot_id: "aib_sales".into(),
+                secret: "secret".into(),
+                websocket_url: "ws://127.0.0.1:9".into(),
+                allowed_users: vec!["*".into()],
+            },
+        );
+
+        let err = deliver_announcement(&config, "wecom", None, "user:alice", "hello")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("multiple wecom accounts configured"));
     }
 }

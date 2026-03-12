@@ -249,6 +249,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
                             &config,
                             channel,
+                            None,
                             target,
                             &announcement,
                         )
@@ -312,7 +313,14 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
+    let normalized = channel.trim().to_ascii_lowercase();
+    let (base, account) = normalized
+        .split_once(':')
+        .map_or((normalized.as_str(), None), |(base, account)| {
+            (base, Some(account.trim()))
+        });
+
+    match base {
         "telegram" => {
             if config.channels_config.telegram.is_none() {
                 anyhow::bail!(
@@ -348,13 +356,40 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
-        "feishu" => {
-            if config.channels_config.feishu.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to feishu but channels_config.feishu is not configured"
-                );
+        "feishu" => match account {
+            Some(account) if !account.is_empty() => {
+                if !config.channels_config.feishu_accounts.contains_key(account) {
+                    anyhow::bail!(
+                            "heartbeat.target is set to feishu:{account} but channels_config.feishu_accounts.{account} is not configured"
+                        );
+                }
             }
-        }
+            Some(_) => anyhow::bail!("heartbeat.target feishu account cannot be empty"),
+            None => {
+                if config.channels_config.feishu.is_none() {
+                    anyhow::bail!(
+                            "heartbeat.target is set to feishu but channels_config.feishu is not configured"
+                        );
+                }
+            }
+        },
+        "wecom" => match account {
+            Some(account) if !account.is_empty() => {
+                if !config.channels_config.wecom_accounts.contains_key(account) {
+                    anyhow::bail!(
+                            "heartbeat.target is set to wecom:{account} but channels_config.wecom_accounts.{account} is not configured"
+                        );
+                }
+            }
+            Some(_) => anyhow::bail!("heartbeat.target wecom account cannot be empty"),
+            None => {
+                if config.channels_config.wecom.is_none() {
+                    anyhow::bail!(
+                            "heartbeat.target is set to wecom but channels_config.wecom is not configured"
+                        );
+                }
+            }
+        },
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
@@ -372,7 +407,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::LarkReceiveMode;
+    use crate::config::schema::{LarkReceiveMode, WeComConfig};
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -606,5 +641,64 @@ mod tests {
             target,
             Some(("feishu".to_string(), "oc_test_target".to_string()))
         );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_named_feishu_account() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("feishu:ops".into());
+        config.heartbeat.to = Some("oc_ops_target".into());
+        config.channels_config.feishu_accounts.insert(
+            "ops".into(),
+            crate::config::FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "secret".into(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("feishu:ops".to_string(), "oc_ops_target".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_named_wecom_account() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("wecom:ops".into());
+        config.heartbeat.to = Some("group:chat-123".into());
+        config.channels_config.wecom_accounts.insert(
+            "ops".into(),
+            WeComConfig {
+                bot_id: "aib_ops".into(),
+                secret: "secret".into(),
+                websocket_url: "wss://openws.work.weixin.qq.com".into(),
+                allowed_users: vec!["*".into()],
+            },
+        );
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("wecom:ops".to_string(), "group:chat-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_unknown_named_feishu_account() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("feishu:ops".into());
+        config.heartbeat.to = Some("oc_ops_target".into());
+
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.feishu_accounts.ops is not configured"));
     }
 }

@@ -81,6 +81,8 @@ pub struct DeliveryConfig {
     #[serde(default)]
     pub channel: Option<String>,
     #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
     pub to: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
@@ -91,6 +93,7 @@ impl Default for DeliveryConfig {
         Self {
             mode: "none".to_string(),
             channel: None,
+            account: None,
             to: None,
             best_effort: true,
         }

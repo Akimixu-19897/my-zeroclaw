@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
@@ -2748,8 +2749,14 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     /// Feishu channel configuration.
     pub feishu: Option<FeishuConfig>,
+    /// Additional named Feishu bot accounts.
+    #[serde(default)]
+    pub feishu_accounts: BTreeMap<String, FeishuConfig>,
     /// WeCom intelligent bot channel configuration.
     pub wecom: Option<WeComConfig>,
+    /// Additional named WeCom intelligent bot accounts.
+    #[serde(default)]
+    pub wecom_accounts: BTreeMap<String, WeComConfig>,
     /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
@@ -2829,11 +2836,11 @@ impl ChannelsConfig {
             ),
             (
                 Box::new(ConfigWrapper::new(self.feishu.as_ref())),
-                self.feishu.is_some(),
+                self.feishu.is_some() || !self.feishu_accounts.is_empty(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.wecom.as_ref())),
-                self.wecom.is_some(),
+                self.wecom.is_some() || !self.wecom_accounts.is_empty(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
@@ -2888,7 +2895,9 @@ impl Default for ChannelsConfig {
             irc: None,
             lark: None,
             feishu: None,
+            feishu_accounts: BTreeMap::new(),
             wecom: None,
+            wecom_accounts: BTreeMap::new(),
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -4469,6 +4478,37 @@ impl Config {
                     "config.channels_config.feishu.verification_token",
                 )?;
             }
+            for (name, fs) in config.channels_config.feishu_accounts.iter_mut() {
+                decrypt_secret(
+                    &store,
+                    &mut fs.app_secret,
+                    &format!("config.channels_config.feishu_accounts.{name}.app_secret"),
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.encrypt_key,
+                    &format!("config.channels_config.feishu_accounts.{name}.encrypt_key"),
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.verification_token,
+                    &format!("config.channels_config.feishu_accounts.{name}.verification_token"),
+                )?;
+            }
+            if let Some(ref mut wc) = config.channels_config.wecom {
+                decrypt_secret(
+                    &store,
+                    &mut wc.secret,
+                    "config.channels_config.wecom.secret",
+                )?;
+            }
+            for (name, wc) in config.channels_config.wecom_accounts.iter_mut() {
+                decrypt_secret(
+                    &store,
+                    &mut wc.secret,
+                    &format!("config.channels_config.wecom_accounts.{name}.secret"),
+                )?;
+            }
             if let Some(ref mut dt) = config.channels_config.dingtalk {
                 decrypt_secret(
                     &store,
@@ -5305,6 +5345,37 @@ impl Config {
                 "config.channels_config.feishu.verification_token",
             )?;
         }
+        for (name, fs) in config_to_save.channels_config.feishu_accounts.iter_mut() {
+            encrypt_secret(
+                &store,
+                &mut fs.app_secret,
+                &format!("config.channels_config.feishu_accounts.{name}.app_secret"),
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.encrypt_key,
+                &format!("config.channels_config.feishu_accounts.{name}.encrypt_key"),
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.verification_token,
+                &format!("config.channels_config.feishu_accounts.{name}.verification_token"),
+            )?;
+        }
+        if let Some(ref mut wc) = config_to_save.channels_config.wecom {
+            encrypt_secret(
+                &store,
+                &mut wc.secret,
+                "config.channels_config.wecom.secret",
+            )?;
+        }
+        for (name, wc) in config_to_save.channels_config.wecom_accounts.iter_mut() {
+            encrypt_secret(
+                &store,
+                &mut wc.secret,
+                &format!("config.channels_config.wecom_accounts.{name}.secret"),
+            )?;
+        }
         if let Some(ref mut dt) = config_to_save.channels_config.dingtalk {
             encrypt_secret(
                 &store,
@@ -5755,7 +5826,9 @@ default_temperature = 0.7
                 irc: None,
                 lark: None,
                 feishu: None,
+                feishu_accounts: BTreeMap::new(),
                 wecom: None,
+                wecom_accounts: BTreeMap::new(),
                 dingtalk: None,
                 qq: None,
                 nostr: None,
@@ -6322,7 +6395,9 @@ allowed_users = ["@ops:matrix.org"]
             irc: None,
             lark: None,
             feishu: None,
+            feishu_accounts: BTreeMap::new(),
             wecom: None,
+            wecom_accounts: BTreeMap::new(),
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -6537,7 +6612,9 @@ channel_id = "C123"
             irc: None,
             lark: None,
             feishu: None,
+            feishu_accounts: BTreeMap::new(),
             wecom: None,
+            wecom_accounts: BTreeMap::new(),
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -8053,6 +8130,28 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn channels_config_treats_named_feishu_accounts_as_configured() {
+        let mut c = ChannelsConfig::default();
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_feishu_123".into(),
+                app_secret: "secret".into(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        assert!(c
+            .channels_except_webhook()
+            .iter()
+            .any(|(handle, ok)| handle.name() == "Feishu" && *ok));
+    }
+
+    #[test]
     async fn wecom_config_serde() {
         let wc = WeComConfig {
             bot_id: "bot_123".into(),
@@ -8075,6 +8174,25 @@ default_model = "legacy-model"
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.websocket_url, "wss://openws.work.weixin.qq.com");
         assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn channels_config_treats_named_wecom_accounts_as_configured() {
+        let mut c = ChannelsConfig::default();
+        c.wecom_accounts.insert(
+            "ops".into(),
+            WeComConfig {
+                bot_id: "bot_123".into(),
+                secret: "secret_abc".into(),
+                websocket_url: "wss://openws.work.weixin.qq.com".into(),
+                allowed_users: vec!["*".into()],
+            },
+        );
+
+        assert!(c
+            .channels_except_webhook()
+            .iter()
+            .any(|(handle, ok)| handle.name() == "WeCom" && *ok));
     }
 
     #[test]

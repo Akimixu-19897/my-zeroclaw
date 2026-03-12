@@ -346,6 +346,21 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+fn should_forward_tool_events_as_thread_messages(channel_name: &str) -> bool {
+    !matches!(channel_name, "cli" | "wecom")
+}
+
+fn final_reply_thread_ts_after_tool_updates(
+    msg: &traits::ChannelMessage,
+    tools_used: bool,
+) -> Option<String> {
+    if tools_used && should_forward_tool_events_as_thread_messages(&msg.channel) {
+        Some(msg.id.clone())
+    } else {
+        msg.thread_ts.clone()
+    }
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -1864,7 +1879,7 @@ async fn process_channel_message(
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = msg.id.clone();
-    let notify_task = if msg.channel == "cli" {
+    let notify_task = if !should_forward_tool_events_as_thread_messages(&msg.channel) {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
         }))
@@ -1927,10 +1942,10 @@ async fn process_channel_message(
         let _ = handle.await;
     }
 
-    // Thread the final reply only if tools were used (multi-message response)
-    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
-        msg.thread_ts = Some(msg.id.clone());
-    }
+    msg.thread_ts = final_reply_thread_ts_after_tool_updates(
+        &msg,
+        notify_observer_flag.tools_used.load(Ordering::Relaxed),
+    );
     // Drop the notify sender so the forwarder task finishes
     drop(notify_observer);
     drop(notify_observer_flag);
@@ -2852,7 +2867,7 @@ fn classify_health_result(
 }
 
 struct ConfiguredChannel {
-    display_name: &'static str,
+    display_name: String,
     channel: Arc<dyn Channel>,
 }
 
@@ -2864,7 +2879,7 @@ fn collect_configured_channels(
 
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push(ConfiguredChannel {
-            display_name: "Telegram",
+            display_name: "Telegram".to_string(),
             channel: Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -2880,7 +2895,7 @@ fn collect_configured_channels(
 
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
-            display_name: "Discord",
+            display_name: "Discord".to_string(),
             channel: Arc::new(DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
@@ -2893,7 +2908,7 @@ fn collect_configured_channels(
 
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
-            display_name: "Slack",
+            display_name: "Slack".to_string(),
             channel: Arc::new(
                 SlackChannel::new(
                     sl.bot_token.clone(),
@@ -2909,7 +2924,7 @@ fn collect_configured_channels(
 
     if let Some(ref mm) = config.channels_config.mattermost {
         channels.push(ConfiguredChannel {
-            display_name: "Mattermost",
+            display_name: "Mattermost".to_string(),
             channel: Arc::new(MattermostChannel::new(
                 mm.url.clone(),
                 mm.bot_token.clone(),
@@ -2923,7 +2938,7 @@ fn collect_configured_channels(
 
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(ConfiguredChannel {
-            display_name: "iMessage",
+            display_name: "iMessage".to_string(),
             channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
         });
     }
@@ -2931,7 +2946,7 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
-            display_name: "Matrix",
+            display_name: "Matrix".to_string(),
             channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
@@ -2954,7 +2969,7 @@ fn collect_configured_channels(
 
     if let Some(ref sig) = config.channels_config.signal {
         channels.push(ConfiguredChannel {
-            display_name: "Signal",
+            display_name: "Signal".to_string(),
             channel: Arc::new(SignalChannel::new(
                 sig.http_url.clone(),
                 sig.account.clone(),
@@ -2978,7 +2993,7 @@ fn collect_configured_channels(
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
                     channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
+                        display_name: "WhatsApp".to_string(),
                         channel: Arc::new(WhatsAppChannel::new(
                             wa.access_token.clone().unwrap_or_default(),
                             wa.phone_number_id.clone().unwrap_or_default(),
@@ -2995,7 +3010,7 @@ fn collect_configured_channels(
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
                     channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
+                        display_name: "WhatsApp".to_string(),
                         channel: Arc::new(WhatsAppWebChannel::new(
                             wa.session_path.clone().unwrap_or_default(),
                             wa.pair_phone.clone(),
@@ -3019,7 +3034,7 @@ fn collect_configured_channels(
 
     if let Some(ref lq) = config.channels_config.linq {
         channels.push(ConfiguredChannel {
-            display_name: "Linq",
+            display_name: "Linq".to_string(),
             channel: Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
                 lq.from_phone.clone(),
@@ -3030,7 +3045,7 @@ fn collect_configured_channels(
 
     if let Some(ref wati_cfg) = config.channels_config.wati {
         channels.push(ConfiguredChannel {
-            display_name: "WATI",
+            display_name: "WATI".to_string(),
             channel: Arc::new(WatiChannel::new(
                 wati_cfg.api_token.clone(),
                 wati_cfg.api_url.clone(),
@@ -3042,7 +3057,7 @@ fn collect_configured_channels(
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push(ConfiguredChannel {
-            display_name: "Nextcloud Talk",
+            display_name: "Nextcloud Talk".to_string(),
             channel: Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
@@ -3053,14 +3068,14 @@ fn collect_configured_channels(
 
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(ConfiguredChannel {
-            display_name: "Email",
+            display_name: "Email".to_string(),
             channel: Arc::new(EmailChannel::new(email_cfg.clone())),
         });
     }
 
     if let Some(ref irc) = config.channels_config.irc {
         channels.push(ConfiguredChannel {
-            display_name: "IRC",
+            display_name: "IRC".to_string(),
             channel: Arc::new(IrcChannel::new(irc::IrcChannelConfig {
                 server: irc.server.clone(),
                 port: irc.port,
@@ -3088,13 +3103,13 @@ fn collect_configured_channels(
                     "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
                 );
                 channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
+                    display_name: "Feishu".to_string(),
                     channel: Arc::new(LarkChannel::from_config(lk)),
                 });
             }
         } else {
             channels.push(ConfiguredChannel {
-                display_name: "Lark",
+                display_name: "Lark".to_string(),
                 channel: Arc::new(LarkChannel::from_lark_config(lk)),
             });
         }
@@ -3103,13 +3118,27 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-lark")]
     if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
-            display_name: "Feishu",
+            display_name: "Feishu".to_string(),
             channel: Arc::new(LarkChannel::from_feishu_config(fs)),
         });
     }
 
+    #[cfg(feature = "channel-lark")]
+    for (account, fs) in &config.channels_config.feishu_accounts {
+        channels.push(ConfiguredChannel {
+            display_name: format!("Feishu[{account}]"),
+            channel: Arc::new(LarkChannel::from_named_feishu_config(
+                format!("feishu:{account}"),
+                fs,
+            )),
+        });
+    }
+
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+    if config.channels_config.lark.is_some()
+        || config.channels_config.feishu.is_some()
+        || !config.channels_config.feishu_accounts.is_empty()
+    {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
         );
@@ -3117,14 +3146,24 @@ fn collect_configured_channels(
 
     if let Some(ref wecom) = config.channels_config.wecom {
         channels.push(ConfiguredChannel {
-            display_name: "WeCom",
+            display_name: "WeCom".to_string(),
             channel: Arc::new(WeComChannel::from_config(wecom)),
+        });
+    }
+
+    for (account, wecom) in &config.channels_config.wecom_accounts {
+        channels.push(ConfiguredChannel {
+            display_name: format!("WeCom[{account}]"),
+            channel: Arc::new(WeComChannel::from_named_config(
+                format!("wecom:{account}"),
+                wecom,
+            )),
         });
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push(ConfiguredChannel {
-            display_name: "DingTalk",
+            display_name: "DingTalk".to_string(),
             channel: Arc::new(DingTalkChannel::new(
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
@@ -3135,7 +3174,7 @@ fn collect_configured_channels(
 
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
-            display_name: "QQ",
+            display_name: "QQ".to_string(),
             channel: Arc::new(QQChannel::new(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
@@ -3146,7 +3185,7 @@ fn collect_configured_channels(
 
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
-            display_name: "ClawdTalk",
+            display_name: "ClawdTalk".to_string(),
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
     }
@@ -3160,7 +3199,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(ConfiguredChannel {
-            display_name: "Nostr",
+            display_name: "Nostr".to_string(),
             channel: Arc::new(
                 NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
             ),
@@ -6453,6 +6492,55 @@ This is an example JSON object for profile settings."#;
             .any(|entry| entry.channel.name() == "mattermost"));
     }
 
+    #[test]
+    fn collect_configured_channels_includes_named_wecom_accounts() {
+        let mut config = Config::default();
+        config.channels_config.wecom_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::WeComConfig {
+                bot_id: "bot-ops".to_string(),
+                secret: "secret-ops".to_string(),
+                websocket_url: "wss://openws.work.weixin.qq.com".to_string(),
+                allowed_users: vec!["*".to_string()],
+            },
+        );
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels
+            .iter()
+            .any(|entry| entry.display_name == "WeCom[ops]"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry.channel.name() == "wecom:ops"));
+    }
+
+    #[test]
+    fn collect_configured_channels_includes_named_feishu_accounts() {
+        let mut config = Config::default();
+        config.channels_config.feishu_accounts.insert(
+            "ops".to_string(),
+            crate::config::schema::FeishuConfig {
+                app_id: "cli_ops".to_string(),
+                app_secret: "secret".to_string(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".to_string()],
+                receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels
+            .iter()
+            .any(|entry| entry.display_name == "Feishu[ops]"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry.channel.name() == "feishu:ops"));
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
@@ -6632,6 +6720,46 @@ This is an example JSON object for profile settings."#;
     fn normalize_empty_input() {
         let result = normalize_cached_channel_turns(vec![]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn wecom_does_not_thread_tool_updates_via_message_id() {
+        assert!(!should_forward_tool_events_as_thread_messages("wecom"));
+
+        let msg = traits::ChannelMessage {
+            id: "wecom-msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "user:alice".to_string(),
+            content: "check cron".to_string(),
+            channel: "wecom".to_string(),
+            timestamp: 1,
+            thread_ts: Some("req-original".to_string()),
+        };
+
+        assert_eq!(
+            final_reply_thread_ts_after_tool_updates(&msg, true).as_deref(),
+            Some("req-original")
+        );
+    }
+
+    #[test]
+    fn slack_keeps_tool_update_threading_via_message_id() {
+        assert!(should_forward_tool_events_as_thread_messages("slack"));
+
+        let msg = traits::ChannelMessage {
+            id: "slack-root-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "C123".to_string(),
+            content: "check cron".to_string(),
+            channel: "slack".to_string(),
+            timestamp: 1,
+            thread_ts: Some("123.456".to_string()),
+        };
+
+        assert_eq!(
+            final_reply_thread_ts_after_tool_updates(&msg, true).as_deref(),
+            Some("slack-root-1")
+        );
     }
 
     // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
