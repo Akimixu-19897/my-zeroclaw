@@ -78,7 +78,7 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -245,6 +245,45 @@ mod tests {
         assert_eq!(content, "deep");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_expands_tilde_path_outside_workspace() {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        else {
+            return;
+        };
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_write_tilde_workspace");
+        let outside_dir = home.join("zeroclaw_test_file_write_tilde");
+        let outside_file = outside_dir.join("out.txt");
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileWriteTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": "~/zeroclaw_test_file_write_tilde/out.txt", "content": "tilde write"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let content = tokio::fs::read_to_string(&outside_file).await.unwrap();
+        assert_eq!(content, "tilde write");
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 
     #[tokio::test]

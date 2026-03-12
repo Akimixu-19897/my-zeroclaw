@@ -14,7 +14,18 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
 ];
 
 /// Shell command execution tool with sandboxing
@@ -391,7 +402,18 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into(), "echo".into()],
+            allowed_commands: vec!["env".into(), "echo".into(), "cat".into()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_open_paths() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            workspace_only: false,
+            forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
     }
@@ -468,6 +490,35 @@ mod tests {
             result.output.contains("PATH="),
             "PATH should be available in shell environment"
         );
+    }
+
+    #[tokio::test]
+    async fn shell_allows_tilde_home_path_when_policy_allows_it() {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        else {
+            return;
+        };
+
+        let outside_dir = home.join("zeroclaw_shell_tilde");
+        let outside_file = outside_dir.join("notes.txt");
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        tokio::fs::write(&outside_file, "shell tilde ok")
+            .await
+            .unwrap();
+
+        let tool = ShellTool::new(test_security_with_open_paths(), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat ~/zeroclaw_shell_tilde/notes.txt"}))
+            .await
+            .expect("cat with tilde path should return a result");
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert!(result.output.contains("shell tilde ok"));
+
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 
     #[tokio::test]
@@ -596,6 +647,10 @@ mod tests {
         assert!(
             SAFE_ENV_VARS.contains(&"TERM"),
             "TERM must be in safe env vars"
+        );
+        assert!(
+            SAFE_ENV_VARS.contains(&"USERPROFILE"),
+            "USERPROFILE must be in safe env vars"
         );
     }
 

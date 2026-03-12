@@ -1,8 +1,8 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
-#[cfg(feature = "channel-lark")]
-use crate::channels::LarkChannel;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -486,9 +486,9 @@ async fn run_job_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     #[cfg(feature = "channel-lark")]
     use crate::config::schema::LarkReceiveMode;
+    use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};

@@ -100,7 +100,7 @@ impl Tool for PdfReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
@@ -375,6 +375,54 @@ mod tests {
             "expected rate limit, got: {:?}",
             r3.error
         );
+    }
+
+    #[tokio::test]
+    async fn tilde_path_outside_workspace_is_expanded() {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        else {
+            return;
+        };
+
+        let workspace = TempDir::new().unwrap();
+        let outside_dir = home.join("zeroclaw_test_pdf_read_tilde");
+        let outside_file = outside_dir.join("test.pdf");
+
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        tokio::fs::write(&outside_file, b"%PDF-1.4 test")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = PdfReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": "~/zeroclaw_test_pdf_read_tilde/test.pdf"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success
+                || result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("PDF extraction"),
+            "unexpected result: success={}, error={:?}",
+            result.success,
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 
     #[cfg(unix)]

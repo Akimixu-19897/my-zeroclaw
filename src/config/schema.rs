@@ -2564,6 +2564,8 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     /// Feishu channel configuration.
     pub feishu: Option<FeishuConfig>,
+    /// WeCom intelligent bot channel configuration.
+    pub wecom: Option<WeComConfig>,
     /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
@@ -2646,6 +2648,10 @@ impl ChannelsConfig {
                 self.feishu.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wecom.as_ref())),
+                self.wecom.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
                 self.dingtalk.is_some(),
             ),
@@ -2698,6 +2704,7 @@ impl Default for ChannelsConfig {
             irc: None,
             lark: None,
             feishu: None,
+            wecom: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -3215,6 +3222,34 @@ impl ChannelConfig for FeishuConfig {
     }
     fn desc() -> &'static str {
         "Feishu Bot"
+    }
+}
+
+fn default_wecom_websocket_url() -> String {
+    "wss://openws.work.weixin.qq.com".to_string()
+}
+
+/// WeCom intelligent bot configuration for websocket long connection.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComConfig {
+    /// Bot ID from WeCom intelligent bot API mode.
+    pub bot_id: String,
+    /// Secret from WeCom intelligent bot API mode.
+    pub secret: String,
+    /// WebSocket endpoint for long connection mode.
+    #[serde(default = "default_wecom_websocket_url")]
+    pub websocket_url: String,
+    /// Allowed WeCom user IDs. Empty = allow all, "*" = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for WeComConfig {
+    fn name() -> &'static str {
+        "WeCom"
+    }
+    fn desc() -> &'static str {
+        "WeCom Intelligent Bot"
     }
 }
 
@@ -5117,6 +5152,7 @@ default_temperature = 0.7
                 irc: None,
                 lark: None,
                 feishu: None,
+                wecom: None,
                 dingtalk: None,
                 qq: None,
                 nostr: None,
@@ -5681,6 +5717,7 @@ allowed_users = ["@ops:matrix.org"]
             irc: None,
             lark: None,
             feishu: None,
+            wecom: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -5895,6 +5932,7 @@ channel_id = "C123"
             irc: None,
             lark: None,
             feishu: None,
+            wecom: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -7407,6 +7445,31 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+    }
+
+    #[test]
+    async fn wecom_config_serde() {
+        let wc = WeComConfig {
+            bot_id: "bot_123".into(),
+            secret: "secret_abc".into(),
+            websocket_url: "wss://openws.work.weixin.qq.com".into(),
+            allowed_users: vec!["user_a".into(), "*".into()],
+        };
+
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WeComConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bot_id, "bot_123");
+        assert_eq!(parsed.secret, "secret_abc");
+        assert_eq!(parsed.websocket_url, "wss://openws.work.weixin.qq.com");
+        assert_eq!(parsed.allowed_users, vec!["user_a", "*"]);
+    }
+
+    #[test]
+    async fn wecom_config_defaults_websocket_url_and_allowed_users() {
+        let json = r#"{"bot_id":"bot_123","secret":"secret_abc"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.websocket_url, "wss://openws.work.weixin.qq.com");
+        assert!(parsed.allowed_users.is_empty());
     }
 
     #[test]

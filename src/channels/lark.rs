@@ -208,7 +208,9 @@ fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkAttachment>)
     (cleaned.trim().to_string(), attachments)
 }
 
-fn classify_lark_outgoing_attachments(attachments: &[LarkAttachment]) -> (Vec<PathBuf>, Vec<String>) {
+fn classify_lark_outgoing_attachments(
+    attachments: &[LarkAttachment],
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut local_images = Vec::new();
     let mut unresolved_markers = Vec::new();
 
@@ -1193,7 +1195,11 @@ impl LarkChannel {
                 );
             }
 
-            ensure_lark_send_success(retry_status, &retry_response, "image upload after token refresh")?;
+            ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "image upload after token refresh",
+            )?;
             return retry_response
                 .pointer("/data/image_key")
                 .and_then(|value| value.as_str())
@@ -1217,7 +1223,8 @@ impl LarkChannel {
         if should_refresh_lark_tenant_token(status, &response) {
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) = self.send_text_once(&url, &new_token, body).await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, body).await?;
 
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
                 anyhow::bail!(
@@ -1414,7 +1421,8 @@ impl Channel for LarkChannel {
             return self.send_json_message(&body).await;
         }
 
-        self.send_text_message(&message.recipient, &raw_content).await
+        self.send_text_message(&message.recipient, &raw_content)
+            .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

@@ -3,7 +3,6 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -156,7 +155,7 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
+        let path = self.security.resolve_tool_path(path_str);
 
         // Restrict reads to workspace directory to prevent arbitrary file exfiltration
         if !self.security.is_path_allowed(path_str) {
@@ -177,7 +176,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +192,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -489,5 +488,40 @@ mod tests {
         assert!(result.output.contains("data:image/png;base64,"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn execute_expands_tilde_path_outside_workspace() {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        else {
+            return;
+        };
+
+        let outside_dir = home.join("zeroclaw_image_info_tilde");
+        let png_path = outside_dir.join("test.png");
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+
+        let tool = ImageInfoTool::new(test_security());
+        let result = tool
+            .execute(json!({"path": "~/zeroclaw_image_info_tilde/test.png"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert!(result.output.contains("Format: png"));
+
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 }

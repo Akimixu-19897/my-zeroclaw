@@ -15,16 +15,10 @@ Last reviewed: **February 18, 2026**.
 
 | Doc | Type | Audience |
 |---|---|---|
-| `README.md` | Current Guide | all readers |
-| `README.zh-CN.md` | Current Guide (localized) | Chinese readers |
-| `README.ja.md` | Current Guide (localized) | Japanese readers |
-| `README.ru.md` | Current Guide (localized) | Russian readers |
-| `README.vi.md` | Current Guide (localized) | Vietnamese readers |
-| `docs/README.md` | Current Guide (hub) | all readers |
-| `docs/README.zh-CN.md` | Current Guide (localized hub) | Chinese readers |
-| `docs/README.ja.md` | Current Guide (localized hub) | Japanese readers |
-| `docs/README.ru.md` | Current Guide (localized hub) | Russian readers |
-| `docs/README.vi.md` | Current Guide (localized hub) | Vietnamese readers |
+| `README.md` | Current Guide (Chinese default) | Chinese readers / default landing |
+| `README.en.md` | Current Guide (English) | English readers |
+| `docs/README.md` | Current Guide (Chinese hub) | Chinese readers / default docs landing |
+| `docs/README.en.md` | Current Guide (English hub) | English readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
 | `docs/structure/README.md` | Current Guide (structure map) | all readers |
 

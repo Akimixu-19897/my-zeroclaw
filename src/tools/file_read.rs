@@ -82,7 +82,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -492,6 +492,48 @@ mod tests {
         assert!(result.output.contains("outside"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_expands_tilde_path_outside_workspace() {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        else {
+            return;
+        };
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_read_tilde_workspace");
+        let outside_dir = home.join("zeroclaw_test_file_read_tilde");
+        let outside_file = outside_dir.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        tokio::fs::write(&outside_file, "tilde outside")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": "~/zeroclaw_test_file_read_tilde/notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert!(result.output.contains("tilde outside"));
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 
     #[tokio::test]

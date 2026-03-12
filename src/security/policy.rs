@@ -149,7 +149,9 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -165,7 +167,22 @@ fn expand_user_path(path: &str) -> PathBuf {
         }
     }
 
+    if let Some(stripped) = path.strip_prefix("~\\") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+
     PathBuf::from(path)
+}
+
+fn resolve_workspace_or_absolute(workspace_dir: &Path, path: &str) -> PathBuf {
+    let expanded = expand_user_path(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace_dir.join(expanded)
+    }
 }
 
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
@@ -915,7 +932,11 @@ impl SecurityPolicy {
 
         // Reject "~user" forms because the shell expands them at runtime and
         // they can escape workspace policy.
-        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+        if path.starts_with('~')
+            && path != "~"
+            && !path.starts_with("~/")
+            && !path.starts_with("~\\")
+        {
             return false;
         }
 
@@ -936,6 +957,15 @@ impl SecurityPolicy {
         }
 
         true
+    }
+
+    /// Resolve a user-provided tool path after `is_path_allowed` succeeds.
+    ///
+    /// Relative paths stay workspace-relative. Absolute paths and `~/...`
+    /// expand to host paths so tools do not accidentally treat them as
+    /// workspace children.
+    pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
+        resolve_workspace_or_absolute(&self.workspace_dir, path)
     }
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
@@ -2334,5 +2364,30 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    #[test]
+    fn is_path_allowed_accepts_tilde_backslash_prefix() {
+        let policy = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..default_policy()
+        };
+        assert!(policy.is_path_allowed("~\\Desktop\\note.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_expands_tilde_backslash_prefix() {
+        let workspace = std::env::temp_dir().join("zeroclaw_policy_tilde_backslash");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..default_policy()
+        };
+
+        let resolved = policy.resolve_tool_path("~\\Desktop\\note.txt");
+        let home = home_dir().unwrap();
+        assert_eq!(resolved, home.join("Desktop\\note.txt"));
     }
 }

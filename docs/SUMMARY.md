@@ -7,18 +7,10 @@ Last refreshed: **February 18, 2026**.
 ## Language Entry
 
 - Docs Structure Map (language/part/function): [structure/README.md](maintainers/structure-README.md)
-- English README: [../README.md](../README.md)
-- Chinese README: [../README.zh-CN.md](../README.zh-CN.md)
-- Japanese README: [../README.ja.md](../README.ja.md)
-- Russian README: [../README.ru.md](../README.ru.md)
-- French README: [../README.fr.md](../README.fr.md)
-- Vietnamese README: [../README.vi.md](../README.vi.md)
-- English Docs Hub: [README.md](README.md)
-- Chinese Docs Hub: [README.zh-CN.md](README.zh-CN.md)
-- Japanese Docs Hub: [README.ja.md](README.ja.md)
-- Russian Docs Hub: [README.ru.md](README.ru.md)
-- French Docs Hub: [README.fr.md](README.fr.md)
-- Vietnamese Docs Hub: [i18n/vi/README.md](i18n/vi/README.md)
+- Chinese README: [../README.md](../README.md)
+- English README: [../README.en.md](../README.en.md)
+- Chinese Docs Hub: [README.md](README.md)
+- English Docs Hub: [README.en.md](README.en.md)
 - i18n Docs Index: [i18n/README.md](i18n/README.md)
 - i18n Coverage Map: [i18n-coverage.md](maintainers/i18n-coverage.md)
 

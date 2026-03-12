@@ -12,12 +12,8 @@ Last refreshed: **February 22, 2026**.
 
 | Language | Entry point | Canonical tree | Notes |
 |---|---|---|---|
-| English | `docs/README.md` | `docs/` | Source-of-truth runtime behavior docs are authored in English first. |
-| Chinese (`zh-CN`) | `docs/README.zh-CN.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Japanese (`ja`) | `docs/README.ja.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Russian (`ru`) | `docs/README.ru.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| French (`fr`) | `docs/README.fr.md` | `docs/` localized hub + selected localized docs | Uses localized hub and shared category structure. |
-| Vietnamese (`vi`) | `docs/i18n/vi/README.md` | `docs/i18n/vi/` | Full Vietnamese tree is canonical under `docs/i18n/vi/`; `docs/vi/` and `docs/*.vi.md` are compatibility paths. |
+| Chinese (`zh-CN`) | `docs/README.md` | `docs/` | Default documentation entrypoint. |
+| English | `docs/README.en.md` | `docs/` | English companion entrypoint. |
 
 ## 2) By Part (Category)
 

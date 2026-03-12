@@ -20,12 +20,8 @@ Use these i18n paths:
 
 | Locale | Root README | Canonical Docs Hub | Commands Ref | Config Ref | Troubleshooting | Status |
 |---|---|---|---|---|---|---|
-| `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
-| `zh-CN` | `README.zh-CN.md` | `docs/README.zh-CN.md` | - | - | - | Hub-level localized |
-| `ja` | `README.ja.md` | `docs/README.ja.md` | - | - | - | Hub-level localized |
-| `ru` | `README.ru.md` | `docs/README.ru.md` | - | - | - | Hub-level localized |
-| `fr` | `README.fr.md` | `docs/README.fr.md` | - | - | - | Hub-level localized |
-| `vi` | `README.vi.md` | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
+| `zh-CN` | `README.md` | `docs/README.md` | - | - | - | Default landing |
+| `en` | `README.en.md` | `docs/README.en.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | English companion |
 
 ## Root README Completeness
 
