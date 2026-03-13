@@ -1,9 +1,13 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -58,6 +62,20 @@ struct WeComStreamContent {
     finish: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "msg_item")]
+    msg_item: Vec<WeComReplyMsgItem>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct WeComReplyMsgItem {
+    msgtype: &'static str,
+    image: WeComReplyImageContent,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct WeComReplyImageContent {
+    base64: String,
+    md5: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -89,6 +107,9 @@ struct WeComInboundBody {
     from: Option<WeComInboundFrom>,
     msgtype: Option<String>,
     text: Option<WeComInboundText>,
+    image: Option<WeComInboundImage>,
+    mixed: Option<WeComInboundMixed>,
+    quote: Option<WeComInboundQuote>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,12 +122,52 @@ struct WeComInboundText {
     content: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct WeComInboundImage {
+    url: Option<String>,
+    aeskey: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeComInboundMixed {
+    #[serde(rename = "msg_item")]
+    msg_item: Option<Vec<WeComInboundMixedItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeComInboundMixedItem {
+    msgtype: Option<String>,
+    text: Option<WeComInboundText>,
+    image: Option<WeComInboundImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeComInboundQuote {
+    msgtype: Option<String>,
+    text: Option<WeComInboundText>,
+    image: Option<WeComInboundImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeComAttachment {
+    target: String,
+}
+
+#[derive(Debug, Clone)]
+struct WeComInboundImageRef {
+    url: String,
+    aeskey: Option<String>,
+}
+
+type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
+
 pub struct WeComChannel {
     name: String,
     bot_id: String,
     secret: String,
     websocket_url: String,
     allowed_users: Vec<String>,
+    workspace_dir: Option<PathBuf>,
     outbound_tx: mpsc::UnboundedSender<WeComOutboundEnvelope>,
     outbound_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WeComOutboundEnvelope>>>,
 }
@@ -118,6 +179,7 @@ impl WeComChannel {
         secret: String,
         websocket_url: String,
         allowed_users: Vec<String>,
+        workspace_dir: Option<PathBuf>,
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         Self {
@@ -126,6 +188,7 @@ impl WeComChannel {
             secret,
             websocket_url,
             allowed_users,
+            workspace_dir,
             outbound_tx,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
         }
@@ -136,12 +199,28 @@ impl WeComChannel {
     }
 
     pub fn from_named_config(name: String, config: &crate::config::schema::WeComConfig) -> Self {
+        Self::from_named_config_with_workspace(name, config, None)
+    }
+
+    pub fn from_config_with_workspace(
+        config: &crate::config::schema::WeComConfig,
+        workspace_dir: PathBuf,
+    ) -> Self {
+        Self::from_named_config_with_workspace("wecom".to_string(), config, Some(workspace_dir))
+    }
+
+    pub fn from_named_config_with_workspace(
+        name: String,
+        config: &crate::config::schema::WeComConfig,
+        workspace_dir: Option<PathBuf>,
+    ) -> Self {
         Self::new(
             name,
             config.bot_id.clone(),
             config.secret.clone(),
             config.websocket_url.clone(),
             config.allowed_users.clone(),
+            workspace_dir,
         )
     }
 
@@ -173,7 +252,13 @@ impl WeComChannel {
         recipient: &str,
         thread_ts: Option<&str>,
     ) -> Result<WeComOutboundEnvelope> {
+        let raw_content = super::strip_tool_call_tags(content);
+        let (cleaned_content, local_images, unresolved_markers) =
+            parse_wecom_attachment_markers(&raw_content);
+        let rendered_content = compose_outbound_text_content(&cleaned_content, &unresolved_markers);
+
         if let Some(req_id) = thread_ts {
+            let msg_item = build_reply_msg_items(&local_images)?;
             let frame = WeComOutboundFrame {
                 cmd: "aibot_respond_msg".to_string(),
                 headers: WeComHeaders {
@@ -184,7 +269,8 @@ impl WeComChannel {
                     stream: WeComStreamContent {
                         id: req_id.to_string(),
                         finish: true,
-                        content: content.to_string(),
+                        content: rendered_content,
+                        msg_item,
                     },
                 }),
             };
@@ -200,6 +286,11 @@ impl WeComChannel {
                 "WeCom proactive send requires chat:<chatid> or group:<chatid>; user:<userid> is only valid for replying to inbound messages"
             );
         }
+        if !local_images.is_empty() {
+            anyhow::bail!(
+                "WeCom proactive send does not support image attachments; use a reply context"
+            );
+        }
         let chat_id = target
             .chat_id
             .or(target.user_id)
@@ -213,7 +304,7 @@ impl WeComChannel {
                 chatid: chat_id,
                 msgtype: "markdown",
                 markdown: WeComTextContent {
-                    content: content.to_string(),
+                    content: rendered_content,
                 },
             }),
         };
@@ -263,10 +354,9 @@ impl WeComChannel {
     {
         timeout(Duration::from_secs(PROACTIVE_SEND_TIMEOUT_SECS), async {
             loop {
-                let incoming = read
-                    .next()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("WeCom websocket closed before {phase} ack"))??;
+                let incoming = read.next().await.ok_or_else(|| {
+                    anyhow::anyhow!("WeCom websocket closed before {phase} ack")
+                })??;
 
                 let frame = match incoming {
                     WsMsg::Text(text) => serde_json::from_str::<WeComInboundFrame>(text.as_ref())
@@ -291,7 +381,9 @@ impl WeComChannel {
                 match frame.errcode {
                     Some(0) => return Ok(()),
                     Some(code) => {
-                        let errmsg = frame.errmsg.unwrap_or_else(|| "unknown WeCom error".to_string());
+                        let errmsg = frame
+                            .errmsg
+                            .unwrap_or_else(|| "unknown WeCom error".to_string());
                         anyhow::bail!("WeCom {phase} failed ({code}): {errmsg}");
                     }
                     None => continue,
@@ -376,6 +468,54 @@ impl WeComChannel {
         })
     }
 
+    async fn parse_inbound_message_with_workspace(
+        frame: WeComInboundFrame,
+        channel_name: &str,
+        workspace_dir: Option<&Path>,
+    ) -> Option<ChannelMessage> {
+        if frame.errcode.is_some() {
+            return None;
+        }
+        let cmd = frame.cmd.as_deref()?;
+        if cmd != "aibot_msg_callback" && cmd != "aibot_callback" {
+            return None;
+        }
+
+        let headers = frame.headers?;
+        let body = frame.body?;
+        let msgtype = body.msgtype.as_deref()?;
+        if !matches!(msgtype, "text" | "image" | "mixed") {
+            return None;
+        }
+
+        let chat_id = body.chatid.clone();
+        let sender = body.from.as_ref()?.userid.clone()?;
+        let content = match render_inbound_content(&body, workspace_dir).await {
+            Ok(Some(content)) => content,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!("WeCom: failed to resolve inbound content: {err}");
+                return None;
+            }
+        };
+        let reply_target = match body.chattype.as_deref() {
+            Some("group") => format!("group:{}", chat_id?),
+            _ => chat_id
+                .map(|chat_id| format!("chat:{chat_id}"))
+                .unwrap_or_else(|| format!("user:{sender}")),
+        };
+
+        Some(ChannelMessage {
+            id: body.msgid.unwrap_or_else(|| new_req_id("msg")),
+            sender,
+            reply_target,
+            content,
+            channel: channel_name.to_string(),
+            timestamp: current_timestamp_secs(),
+            thread_ts: Some(headers.req_id),
+        })
+    }
+
     fn allows_sender(&self, sender: &str) -> bool {
         self.allowed_users.is_empty()
             || self.allowed_users.iter().any(|allowed| {
@@ -425,6 +565,316 @@ impl WeComChannel {
             }
         }
     }
+}
+
+fn parse_wecom_attachment_markers(message: &str) -> (String, Vec<PathBuf>, Vec<String>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let marker_text = &message[start + 1..end];
+        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
+            if !matches!(kind.trim().to_ascii_uppercase().as_str(), "IMAGE" | "PHOTO") {
+                return None;
+            }
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(WeComAttachment {
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            let path = Path::new(&attachment.target);
+            if path.exists() && path.is_file() {
+                attachments.push(path.to_path_buf());
+            } else {
+                unresolved.push(format!("[IMAGE:{}]", attachment.target));
+            }
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), attachments, unresolved)
+}
+
+fn compose_outbound_text_content(content: &str, unresolved_markers: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !content.trim().is_empty() {
+        parts.push(content.trim().to_string());
+    }
+    if !unresolved_markers.is_empty() {
+        parts.push(unresolved_markers.join("\n"));
+    }
+    parts.join("\n")
+}
+
+fn build_reply_msg_items(image_paths: &[PathBuf]) -> Result<Vec<WeComReplyMsgItem>> {
+    image_paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("read WeCom reply image {}", path.display()))?;
+            Ok(WeComReplyMsgItem {
+                msgtype: "image",
+                image: WeComReplyImageContent {
+                    base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    md5: format!("{:x}", md5::compute(&bytes)),
+                },
+            })
+        })
+        .collect()
+}
+
+fn collect_inbound_parts(body: &WeComInboundBody) -> (Vec<String>, Vec<WeComInboundImageRef>) {
+    let mut text_parts = Vec::new();
+    let mut image_refs = Vec::new();
+
+    if body.msgtype.as_deref() == Some("mixed") {
+        if let Some(items) = body
+            .mixed
+            .as_ref()
+            .and_then(|mixed| mixed.msg_item.as_ref())
+        {
+            for item in items {
+                match item.msgtype.as_deref() {
+                    Some("text") => {
+                        if let Some(content) =
+                            item.text.as_ref().and_then(|text| text.content.as_ref())
+                        {
+                            let trimmed = content.trim();
+                            if !trimmed.is_empty() {
+                                text_parts.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    Some("image") => {
+                        if let Some(url) = item.image.as_ref().and_then(|image| image.url.as_ref())
+                        {
+                            image_refs.push(WeComInboundImageRef {
+                                url: url.clone(),
+                                aeskey: item.image.as_ref().and_then(|image| image.aeskey.clone()),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        if let Some(content) = body.text.as_ref().and_then(|text| text.content.as_ref()) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                text_parts.push(trimmed.to_string());
+            }
+        }
+        if let Some(url) = body.image.as_ref().and_then(|image| image.url.as_ref()) {
+            image_refs.push(WeComInboundImageRef {
+                url: url.clone(),
+                aeskey: body.image.as_ref().and_then(|image| image.aeskey.clone()),
+            });
+        }
+    }
+
+    if let Some(quote) = &body.quote {
+        if quote.msgtype.as_deref() == Some("text") {
+            if let Some(content) = quote.text.as_ref().and_then(|text| text.content.as_ref()) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    text_parts.push(trimmed.to_string());
+                }
+            }
+        }
+        if quote.msgtype.as_deref() == Some("image") {
+            if let Some(url) = quote.image.as_ref().and_then(|image| image.url.as_ref()) {
+                image_refs.push(WeComInboundImageRef {
+                    url: url.clone(),
+                    aeskey: quote.image.as_ref().and_then(|image| image.aeskey.clone()),
+                });
+            }
+        }
+    }
+
+    (text_parts, image_refs)
+}
+
+async fn render_inbound_content(
+    body: &WeComInboundBody,
+    workspace_dir: Option<&Path>,
+) -> Result<Option<String>> {
+    let (text_parts, image_refs) = collect_inbound_parts(body);
+    let mut blocks = Vec::new();
+
+    for image in image_refs {
+        let marker = match workspace_dir {
+            Some(workspace_dir) => match download_and_store_image(&image, workspace_dir).await {
+                Ok(path) => format!("[IMAGE:{}]", path.display()),
+                Err(err) => {
+                    tracing::warn!("WeCom: image download failed for {}: {err}", image.url);
+                    format!("[IMAGE:{}]", image.url)
+                }
+            },
+            None => format!("[IMAGE:{}]", image.url),
+        };
+        blocks.push(marker);
+    }
+
+    for text in text_parts {
+        blocks.push(text);
+    }
+
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(blocks.join("\n\n")))
+}
+
+async fn download_and_store_image(
+    image: &WeComInboundImageRef,
+    workspace_dir: &Path,
+) -> Result<PathBuf> {
+    let response = reqwest::get(&image.url)
+        .await
+        .with_context(|| format!("download WeCom image {}", image.url))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("download WeCom image failed with status {status}");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("read WeCom image body {}", image.url))?;
+
+    let decrypted = if let Some(aeskey) = image.aeskey.as_deref() {
+        decrypt_wecom_file(bytes.as_ref(), aeskey)?
+    } else {
+        bytes.to_vec()
+    };
+
+    let ext =
+        detect_image_extension(content_type.as_deref(), &decrypted, &image.url).unwrap_or("png");
+    let file_name = format!(
+        "wecom_{}_{}.{}",
+        current_timestamp_millis(),
+        random_suffix(),
+        ext
+    );
+    let output_dir = workspace_dir.join("channels").join("wecom").join("inbound");
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .with_context(|| format!("create WeCom inbound image dir {}", output_dir.display()))?;
+    let output_path = output_dir.join(file_name);
+    tokio::fs::write(&output_path, &decrypted)
+        .await
+        .with_context(|| format!("write WeCom inbound image {}", output_path.display()))?;
+    Ok(output_path)
+}
+
+fn decrypt_wecom_file(encrypted: &[u8], aeskey: &str) -> Result<Vec<u8>> {
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(aeskey)
+        .context("decode WeCom aeskey")?;
+    if key.len() != 32 {
+        anyhow::bail!(
+            "invalid WeCom aeskey length: expected 32 bytes, got {}",
+            key.len()
+        );
+    }
+    let iv = &key[..16];
+    let mut buffer = encrypted.to_vec();
+    let decrypted = Aes256CbcDecryptor::new_from_slices(&key, iv)
+        .context("initialize WeCom AES-256-CBC decryptor")?
+        .decrypt_padded_mut::<NoPadding>(&mut buffer)
+        .context("decrypt WeCom image payload")?;
+    strip_pkcs7_padding_32(decrypted)
+}
+
+fn strip_pkcs7_padding_32(bytes: &[u8]) -> Result<Vec<u8>> {
+    let Some(&pad_len) = bytes.last() else {
+        anyhow::bail!("empty decrypted WeCom payload");
+    };
+    let pad_len = usize::from(pad_len);
+    if pad_len == 0 || pad_len > 32 || pad_len > bytes.len() {
+        anyhow::bail!("invalid WeCom PKCS#7 padding length: {pad_len}");
+    }
+    if !bytes[bytes.len() - pad_len..]
+        .iter()
+        .all(|byte| usize::from(*byte) == pad_len)
+    {
+        anyhow::bail!("invalid WeCom PKCS#7 padding bytes");
+    }
+    Ok(bytes[..bytes.len() - pad_len].to_vec())
+}
+
+fn detect_image_extension(
+    content_type: Option<&str>,
+    bytes: &[u8],
+    url: &str,
+) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+
+    if let Some(content_type) = content_type {
+        match content_type.split(';').next().unwrap_or_default().trim() {
+            "image/png" => return Some("png"),
+            "image/jpeg" => return Some("jpg"),
+            "image/gif" => return Some("gif"),
+            "image/webp" => return Some("webp"),
+            "image/bmp" => return Some("bmp"),
+            _ => {}
+        }
+    }
+
+    Path::new(url)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| match ext.to_ascii_lowercase().as_str() {
+            "png" => "png",
+            "jpg" | "jpeg" => "jpg",
+            "gif" => "gif",
+            "webp" => "webp",
+            "bmp" => "bmp",
+            _ => "png",
+        })
 }
 
 #[async_trait]
@@ -521,7 +971,11 @@ impl Channel for WeComChannel {
                                                 write.send(WsMsg::Text(next_payload.into())).await?;
                                             }
                                         }
-                                        if let Some(message) = Self::parse_inbound_message(frame, self.name()) {
+                                        if let Some(message) = Self::parse_inbound_message_with_workspace(
+                                            frame,
+                                            self.name(),
+                                            self.workspace_dir.as_deref(),
+                                        ).await {
                                             if !self.allows_sender(&message.sender) {
                                                 tracing::warn!("WeCom: ignoring {} (not in allowed_users)", message.sender);
                                                 continue;
@@ -537,7 +991,11 @@ impl Channel for WeComChannel {
                             Some(Ok(WsMsg::Binary(bytes))) => {
                                 if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                                     if let Ok(frame) = serde_json::from_str::<WeComInboundFrame>(&text) {
-                                        if let Some(message) = Self::parse_inbound_message(frame, self.name()) {
+                                        if let Some(message) = Self::parse_inbound_message_with_workspace(
+                                            frame,
+                                            self.name(),
+                                            self.workspace_dir.as_deref(),
+                                        ).await {
                                             if !self.allows_sender(&message.sender) {
                                                 tracing::warn!("WeCom: ignoring {} (not in allowed_users)", message.sender);
                                                 continue;
@@ -608,6 +1066,7 @@ fn current_timestamp_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -825,6 +1284,7 @@ mod tests {
             "secret-1".into(),
             format!("ws://{addr}"),
             vec!["*".into()],
+            None,
         );
 
         channel
@@ -843,6 +1303,7 @@ mod tests {
             "secret-1".into(),
             "ws://127.0.0.1:9".into(),
             vec!["*".into()],
+            None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
@@ -872,5 +1333,148 @@ mod tests {
         let req_id = new_req_id("aibot_send_msg");
         assert!(req_id.starts_with("aibot_send_msg_"));
         assert!(req_id.split('_').count() >= 4);
+    }
+
+    #[tokio::test]
+    async fn parse_inbound_image_message_downloads_to_workspace() {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                image_bytes.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&image_bytes).await.unwrap();
+        });
+
+        let workspace = tempfile::tempdir().unwrap();
+        let frame: WeComInboundFrame = serde_json::from_str(&format!(
+            r#"{{
+              "cmd":"aibot_callback",
+              "headers":{{"req_id":"req-image"}},
+              "body":{{
+                "msgid":"msg-image",
+                "chatid":"chat-image",
+                "chattype":"single",
+                "from":{{"userid":"zhangsan"}},
+                "msgtype":"image",
+                "image":{{"url":"http://{addr}/image.png"}}
+              }}
+            }}"#
+        ))
+        .unwrap();
+
+        let message = WeComChannel::parse_inbound_message_with_workspace(
+            frame,
+            "wecom",
+            Some(workspace.path()),
+        )
+        .await
+        .expect("parsed message");
+
+        assert_eq!(message.sender, "zhangsan");
+        assert_eq!(message.reply_target, "chat:chat-image");
+        assert!(message.content.starts_with("[IMAGE:"));
+        let image_path = message
+            .content
+            .strip_prefix("[IMAGE:")
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap();
+        assert!(
+            Path::new(image_path).exists(),
+            "downloaded image missing: {image_path}"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parse_inbound_mixed_message_combines_images_and_text() {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                image_bytes.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&image_bytes).await.unwrap();
+        });
+
+        let workspace = tempfile::tempdir().unwrap();
+        let frame: WeComInboundFrame = serde_json::from_str(&format!(
+            r#"{{
+              "cmd":"aibot_callback",
+              "headers":{{"req_id":"req-mixed"}},
+              "body":{{
+                "msgid":"msg-mixed",
+                "chatid":"group-1",
+                "chattype":"group",
+                "from":{{"userid":"lisi"}},
+                "msgtype":"mixed",
+                "mixed":{{
+                  "msg_item":[
+                    {{"msgtype":"image","image":{{"url":"http://{addr}/mix.png"}}}},
+                    {{"msgtype":"text","text":{{"content":"请描述这张图"}}}}
+                  ]
+                }}
+              }}
+            }}"#
+        ))
+        .unwrap();
+
+        let message = WeComChannel::parse_inbound_message_with_workspace(
+            frame,
+            "wecom",
+            Some(workspace.path()),
+        )
+        .await
+        .expect("parsed mixed message");
+
+        assert_eq!(message.reply_target, "group:group-1");
+        assert!(message.content.contains("[IMAGE:"));
+        assert!(message.content.contains("请描述这张图"));
+
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn build_send_frame_reply_converts_image_marker_to_msg_item() {
+        let workspace = tempfile::tempdir().unwrap();
+        let image_path = workspace.path().join("reply.png");
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=")
+            .unwrap();
+        std::fs::write(&image_path, image_bytes).unwrap();
+
+        let payload = WeComChannel::build_send_frame(
+            &format!("已处理\n[IMAGE:{}]", image_path.display()),
+            "group:chat-1",
+            Some("req-image-reply"),
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&payload.payload).unwrap();
+        assert_eq!(value["cmd"], "aibot_respond_msg");
+        assert_eq!(value["body"]["stream"]["content"], "已处理");
+        assert_eq!(value["body"]["stream"]["finish"], true);
+        assert_eq!(value["body"]["stream"]["msg_item"][0]["msgtype"], "image");
+        assert!(value["body"]["stream"]["msg_item"][0]["image"]["base64"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(value["body"]["stream"]["msg_item"][0]["image"]["md5"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
     }
 }

@@ -1,4 +1,15 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::{
+    lark_inbound::{
+        parse_lark_inbound_resources, parse_lark_text_content, render_lark_fallback_content,
+        LarkParsedMessage,
+    },
+    lark_media::{
+        content_type_from_response, extract_response_file_name, store_inbound_resource,
+        LarkDownloadedResource,
+    },
+    lark_outbound::LarkOutboundRequest,
+};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -8,7 +19,6 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
-use uuid::Uuid;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -63,14 +73,15 @@ enum LarkPlatform {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkAttachmentKind {
+pub(crate) enum LarkAttachmentKind {
     Image,
+    Document,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LarkAttachment {
-    kind: LarkAttachmentKind,
-    target: String,
+pub(crate) struct LarkAttachment {
+    pub(crate) kind: LarkAttachmentKind,
+    pub(crate) target: String,
 }
 
 impl LarkPlatform {
@@ -114,6 +125,7 @@ impl LarkAttachmentKind {
     fn from_marker(marker: &str) -> Option<Self> {
         match marker.trim().to_ascii_uppercase().as_str() {
             "IMAGE" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
             _ => None,
         }
     }
@@ -135,11 +147,13 @@ fn infer_lark_attachment_kind_from_target(target: &str) -> Option<LarkAttachment
 
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(LarkAttachmentKind::Image),
+        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
+        | "xlsx" | "ppt" | "pptx" => Some(LarkAttachmentKind::Document),
         _ => None,
     }
 }
 
-fn parse_lark_path_only_attachment(message: &str) -> Option<LarkAttachment> {
+pub(crate) fn parse_lark_path_only_attachment(message: &str) -> Option<LarkAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -163,7 +177,7 @@ fn parse_lark_path_only_attachment(message: &str) -> Option<LarkAttachment> {
     })
 }
 
-fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkAttachment>) {
+pub(crate) fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
     let mut cursor = 0usize;
@@ -208,24 +222,31 @@ fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkAttachment>)
     (cleaned.trim().to_string(), attachments)
 }
 
-fn classify_lark_outgoing_attachments(
+pub(crate) fn classify_lark_outgoing_attachments(
     attachments: &[LarkAttachment],
-) -> (Vec<PathBuf>, Vec<String>) {
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
     let mut local_images = Vec::new();
+    let mut local_documents = Vec::new();
     let mut unresolved_markers = Vec::new();
 
     for attachment in attachments {
         let target = attachment.target.trim();
         let path = Path::new(target);
         if path.exists() && path.is_file() {
-            local_images.push(path.to_path_buf());
+            match attachment.kind {
+                LarkAttachmentKind::Image => local_images.push(path.to_path_buf()),
+                LarkAttachmentKind::Document => local_documents.push(path.to_path_buf()),
+            }
             continue;
         }
 
-        unresolved_markers.push(format!("[IMAGE:{target}]"));
+        unresolved_markers.push(match attachment.kind {
+            LarkAttachmentKind::Image => format!("[IMAGE:{target}]"),
+            LarkAttachmentKind::Document => format!("[DOCUMENT:{target}]"),
+        });
     }
 
-    (local_images, unresolved_markers)
+    (local_images, local_documents, unresolved_markers)
 }
 
 fn build_lark_text_message_body(recipient: &str, content: &str) -> serde_json::Value {
@@ -241,6 +262,14 @@ fn build_lark_image_message_body(recipient: &str, image_key: &str) -> serde_json
         "receive_id": recipient,
         "msg_type": "image",
         "content": serde_json::json!({ "image_key": image_key }).to_string(),
+    })
+}
+
+fn build_lark_file_message_body(recipient: &str, file_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "file",
+        "content": serde_json::json!({ "file_key": file_key }).to_string(),
     })
 }
 
@@ -343,14 +372,26 @@ struct LarkSenderId {
 
 #[derive(Debug, serde::Deserialize)]
 struct LarkMessage {
+    #[serde(default)]
     message_id: String,
+    #[serde(default)]
     chat_id: String,
+    #[serde(default)]
     chat_type: String,
+    #[serde(default)]
     message_type: String,
     #[serde(default)]
     content: String,
     #[serde(default)]
     mentions: Vec<serde_json::Value>,
+    #[serde(default)]
+    root_id: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    create_time: Option<String>,
 }
 
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
@@ -435,6 +476,7 @@ fn ensure_lark_send_success(
 #[derive(Clone)]
 pub struct LarkChannel {
     name_override: Option<String>,
+    account_id: String,
     app_id: String,
     app_secret: String,
     verification_token: String,
@@ -452,6 +494,7 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    workspace_dir: Option<PathBuf>,
 }
 
 impl LarkChannel {
@@ -485,6 +528,7 @@ impl LarkChannel {
     ) -> Self {
         Self {
             name_override: None,
+            account_id: "default".to_string(),
             app_id,
             app_secret,
             verification_token,
@@ -497,6 +541,7 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            workspace_dir: None,
         }
     }
 
@@ -554,8 +599,21 @@ impl LarkChannel {
         config: &crate::config::schema::FeishuConfig,
     ) -> Self {
         let mut ch = Self::from_feishu_config(config);
+        ch.account_id = name
+            .strip_prefix("feishu:")
+            .unwrap_or(name.as_str())
+            .to_string();
         ch.name_override = Some(name);
         ch
+    }
+
+    pub fn with_workspace_dir(mut self, workspace_dir: Option<PathBuf>) -> Self {
+        self.workspace_dir = workspace_dir;
+        self
+    }
+
+    fn account_id(&self) -> &str {
+        &self.account_id
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -590,6 +648,10 @@ impl LarkChannel {
 
     fn upload_image_url(&self) -> String {
         format!("{}/im/v1/images", self.api_base())
+    }
+
+    fn upload_file_url(&self) -> String {
+        format!("{}/im/v1/files", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -926,45 +988,12 @@ impl LarkChannel {
                         seen.insert(lark_msg.message_id.clone(), now);
                     }
 
-                    // Decode content by type (mirrors clawdbot-feishu parsing)
-                    let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
-                        "text" => {
-                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
-                                Some(t) => (t.to_string(), Vec::new()),
-                                None => continue,
-                            }
-                        }
-                        "post" => match parse_post_content_details(&lark_msg.content) {
-                            Some(details) => (details.text, details.mentioned_open_ids),
-                            None => continue,
-                        },
-                        _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
+                    let Some(parsed) = self.parse_inbound_message(sender_open_id, lark_msg) else {
+                        continue;
                     };
 
-                    // Strip @_user_N placeholders
-                    let text = strip_at_placeholders(&text);
-                    let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
-
-                    // Group-chat: only respond when explicitly @-mentioned
-                    let bot_open_id = self.resolved_bot_open_id();
-                    if lark_msg.chat_type == "group"
-                        && !should_respond_in_group(
-                            self.mention_only,
-                            bot_open_id.as_deref(),
-                            &lark_msg.mentions,
-                            &post_mentioned_open_ids,
-                        )
-                    {
-                        continue;
-                    }
-
                     let ack_emoji =
-                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
+                        random_lark_ack_reaction(Some(&event_payload), &parsed.text).to_string();
                     let reaction_channel = self.clone();
                     let reaction_message_id = lark_msg.message_id.clone();
                     tokio::spawn(async move {
@@ -973,17 +1002,8 @@ impl LarkChannel {
                             .await;
                     });
 
-                    let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
-                        reply_target: lark_msg.chat_id.clone(),
-                        content: text,
-                        channel: self.channel_name().to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        thread_ts: None,
+                    let Some(channel_msg) = self.parsed_to_channel_message(parsed).await else {
+                        continue;
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1192,6 +1212,39 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    async fn upload_file_once(
+        &self,
+        token: &str,
+        file_path: &Path,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let file_bytes = tokio::fs::read(file_path).await?;
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+        let file_part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(mime.as_ref())?;
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .text("file_name", file_name.to_string())
+            .part("file", file_part);
+
+        let resp = self
+            .http_client()
+            .post(self.upload_file_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
     async fn upload_image_with_retry(&self, image_path: &Path) -> anyhow::Result<String> {
         let token = self.get_tenant_access_token().await?;
         let (status, response) = self.upload_image_once(&token, image_path).await?;
@@ -1228,6 +1281,42 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::anyhow!("missing image_key in Lark image upload response"))
     }
 
+    async fn upload_file_with_retry(&self, file_path: &Path) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self.upload_file_once(&token, file_path).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let refreshed_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.upload_file_once(&refreshed_token, file_path).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark file upload failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "file upload after token refresh",
+            )?;
+            return retry_response
+                .pointer("/data/file_key")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow::anyhow!("missing file_key in Lark file upload response"));
+        }
+
+        ensure_lark_send_success(status, &response, "file upload without token refresh")?;
+        response
+            .pointer("/data/file_key")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("missing file_key in Lark file upload response"))
+    }
+
     async fn send_json_message(&self, body: &serde_json::Value) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
@@ -1258,130 +1347,352 @@ impl LarkChannel {
         self.send_json_message(&body).await
     }
 
-    /// Parse an event callback payload and extract text messages
-    pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
-        let mut messages = Vec::new();
-
-        // Lark event v2 structure:
-        // { "header": { "event_type": "im.message.receive_v1" }, "event": { "message": { ... }, "sender": { ... } } }
-        let event_type = payload
-            .pointer("/header/event_type")
-            .and_then(|e| e.as_str())
-            .unwrap_or("");
-
-        if event_type != "im.message.receive_v1" {
-            return messages;
-        }
-
-        let event = match payload.get("event") {
-            Some(e) => e,
-            None => return messages,
+    async fn download_message_resource(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        resource_type: &str,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>, Option<String>)> {
+        let build_url = || {
+            format!(
+                "{}/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}",
+                self.api_base()
+            )
         };
 
-        // Extract sender open_id
-        let open_id = event
-            .pointer("/sender/sender_id/open_id")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let fetch_once = async |token: &str| -> anyhow::Result<reqwest::Response> {
+            let response = self
+                .http_client()
+                .get(build_url())
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+            Ok(response)
+        };
 
-        if open_id.is_empty() {
-            return messages;
+        let token = self.get_tenant_access_token().await?;
+        let mut response = fetch_once(&token).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            let refreshed = self.get_tenant_access_token().await?;
+            response = fetch_once(&refreshed).await?;
         }
 
-        // Check allowlist
-        if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring message from unauthorized user: {open_id}");
-            return messages;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Lark inbound resource download failed: message_id={message_id} file_key={file_key} type={resource_type} status={status} body={body}"
+            );
         }
 
-        // Extract message content (text and post supported)
-        let msg_type = event
-            .pointer("/message/message_type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let content_type = content_type_from_response(&response);
+        let file_name = extract_response_file_name(&response);
+        let bytes = response.bytes().await?.to_vec();
+        Ok((bytes, content_type, file_name))
+    }
 
-        let chat_type = event
-            .pointer("/message/chat_type")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+    async fn materialize_inbound_resources(
+        &self,
+        parsed: &LarkParsedMessage,
+    ) -> Vec<LarkDownloadedResource> {
+        let Some(workspace_dir) = self.workspace_dir.as_deref() else {
+            return Vec::new();
+        };
 
-        let mentions = event
-            .pointer("/message/mentions")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let content_str = event
-            .pointer("/message/content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-
-        let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
-            "text" => {
-                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    });
-                match extracted {
-                    Some(t) => (t, Vec::new()),
-                    None => return messages,
-                }
+        let mut downloaded = Vec::new();
+        for resource in &parsed.resources {
+            match self
+                .download_message_resource(
+                    &parsed.message_id,
+                    &resource.file_key,
+                    resource.kind.resource_type(),
+                )
+                .await
+            {
+                Ok((bytes, content_type, file_name)) => match store_inbound_resource(
+                    workspace_dir,
+                    self.channel_name(),
+                    self.account_id(),
+                    &parsed.message_id,
+                    resource,
+                    &bytes,
+                    content_type.as_deref(),
+                    file_name.as_deref(),
+                )
+                .await
+                {
+                    Ok(saved) => downloaded.push(saved),
+                    Err(err) => tracing::warn!(
+                        "Lark: failed to store inbound {} resource {}: {err}",
+                        resource.kind.resource_type(),
+                        resource.file_key
+                    ),
+                },
+                Err(err) => tracing::warn!(
+                    "Lark: failed to download inbound {} resource {}: {err}",
+                    resource.kind.resource_type(),
+                    resource.file_key
+                ),
             }
-            "post" => match parse_post_content_details(content_str) {
-                Some(details) => (details.text, details.mentioned_open_ids),
-                None => return messages,
-            },
+        }
+
+        downloaded
+    }
+
+    fn build_inbound_content(
+        &self,
+        parsed: &LarkParsedMessage,
+        downloaded: &[LarkDownloadedResource],
+    ) -> String {
+        let mut blocks = Vec::new();
+
+        for resource in &parsed.resources {
+            if let Some(saved) = downloaded
+                .iter()
+                .find(|item| item.file_key == resource.file_key)
+            {
+                blocks.push(format!(
+                    "[{}:{}]",
+                    resource.kind.marker_label(),
+                    saved.path.display()
+                ));
+            } else {
+                blocks.push(resource.kind.placeholder().to_string());
+            }
+        }
+
+        let text = parsed.text.trim();
+        if !text.is_empty() {
+            blocks.push(text.to_string());
+        }
+
+        blocks.join("\n\n")
+    }
+
+    fn parse_inbound_message(
+        &self,
+        sender_open_id: &str,
+        message: &LarkMessage,
+    ) -> Option<LarkParsedMessage> {
+        if sender_open_id.is_empty() {
+            return None;
+        }
+        if !self.is_user_allowed(sender_open_id) {
+            tracing::warn!("Lark: ignoring message from unauthorized user: {sender_open_id}");
+            return None;
+        }
+
+        let resources = parse_lark_inbound_resources(&message.message_type, &message.content);
+        let interactive_fallback = match message.message_type.as_str() {
+            "interactive" => Some("<interactive card>"),
+            _ => None,
+        };
+
+        let (text, post_mentioned_open_ids) = match message.message_type.as_str() {
+            "text" => (parse_lark_text_content(&message.content)?, Vec::new()),
+            "post" => {
+                let details = parse_post_content_details(&message.content)?;
+                (details.text, details.mentioned_open_ids)
+            }
+            "image" | "file" | "audio" | "media" | "video" => (String::new(), Vec::new()),
+            "interactive" => (
+                render_lark_fallback_content("", &resources, interactive_fallback),
+                Vec::new(),
+            ),
             _ => {
-                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
-                return messages;
+                tracing::debug!(
+                    "Lark: skipping unsupported message type: {}",
+                    message.message_type
+                );
+                return None;
             }
         };
 
+        let text = strip_at_placeholders(&text).trim().to_string();
         let bot_open_id = self.resolved_bot_open_id();
-        if chat_type == "group"
+        if message.chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
                 bot_open_id.as_deref(),
-                &mentions,
+                &message.mentions,
                 &post_mentioned_open_ids,
             )
         {
-            return messages;
+            return None;
         }
 
-        let timestamp = event
-            .pointer("/message/create_time")
-            .and_then(|t| t.as_str())
-            .and_then(|t| t.parse::<u64>().ok())
-            // Lark timestamps are in milliseconds
-            .map(|ms| ms / 1000)
-            .unwrap_or_else(|| {
+        if text.is_empty() && resources.is_empty() {
+            return None;
+        }
+
+        let create_time_secs = message
+            .create_time
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|ms| ms / 1000);
+
+        Some(LarkParsedMessage {
+            message_id: if message.message_id.is_empty() {
+                format!(
+                    "lark:{sender_open_id}:{}",
+                    message.create_time.as_deref().unwrap_or("0")
+                )
+            } else {
+                message.message_id.clone()
+            },
+            chat_id: if message.chat_id.is_empty() {
+                sender_open_id.to_string()
+            } else {
+                message.chat_id.clone()
+            },
+            sender_open_id: sender_open_id.to_string(),
+            chat_type: if message.chat_type.is_empty() {
+                "p2p".to_string()
+            } else {
+                message.chat_type.clone()
+            },
+            message_type: message.message_type.clone(),
+            create_time_secs,
+            root_id: message.root_id.clone(),
+            parent_id: message.parent_id.clone(),
+            thread_id: message.thread_id.clone(),
+            mentions: message.mentions.clone(),
+            text,
+            post_mentioned_open_ids,
+            resources,
+        })
+    }
+
+    async fn parsed_to_channel_message(&self, parsed: LarkParsedMessage) -> Option<ChannelMessage> {
+        let downloaded = self.materialize_inbound_resources(&parsed).await;
+        let content = if parsed.resources.is_empty() {
+            parsed.text.clone()
+        } else {
+            self.build_inbound_content(&parsed, &downloaded)
+        };
+        if content.trim().is_empty() {
+            return None;
+        }
+
+        Some(ChannelMessage {
+            id: parsed.message_id.clone(),
+            sender: parsed.chat_id.clone(),
+            reply_target: parsed.chat_id,
+            content,
+            channel: self.channel_name().to_string(),
+            timestamp: parsed.create_time_secs.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs()
-            });
+            }),
+            thread_ts: parsed.thread_id.or(parsed.root_id),
+        })
+    }
 
-        let chat_id = event
-            .pointer("/message/chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or(open_id);
+    /// Parse an event callback payload synchronously without downloading media.
+    pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let event_type = payload
+            .pointer("/header/event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        if event_type != "im.message.receive_v1" {
+            return Vec::new();
+        }
 
-        messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
-            reply_target: chat_id.to_string(),
-            content: text,
+        let event = match payload.get("event") {
+            Some(event) => event,
+            None => return Vec::new(),
+        };
+
+        let sender_open_id = event
+            .pointer("/sender/sender_id/open_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let message: LarkMessage = match serde_json::from_value(
+            event
+                .get("message")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        ) {
+            Ok(message) => message,
+            Err(err) => {
+                tracing::warn!("Lark: failed to parse event message payload: {err}");
+                return Vec::new();
+            }
+        };
+
+        let Some(parsed) = self.parse_inbound_message(sender_open_id, &message) else {
+            return Vec::new();
+        };
+        let content = if parsed.resources.is_empty() {
+            parsed.text.clone()
+        } else {
+            self.build_inbound_content(&parsed, &[])
+        };
+        if content.trim().is_empty() {
+            return Vec::new();
+        }
+
+        vec![ChannelMessage {
+            id: parsed.message_id.clone(),
+            sender: parsed.chat_id.clone(),
+            reply_target: parsed.chat_id,
+            content,
             channel: self.channel_name().to_string(),
-            timestamp,
-            thread_ts: None,
-        });
+            timestamp: parsed.create_time_secs.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
+            thread_ts: parsed.thread_id.or(parsed.root_id),
+        }]
+    }
 
-        messages
+    /// Parse an event callback payload and download media when workspace storage is available.
+    pub async fn parse_event_payload_async(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Vec<ChannelMessage> {
+        let event_type = payload
+            .pointer("/header/event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        if event_type != "im.message.receive_v1" {
+            return Vec::new();
+        }
+
+        let event = match payload.get("event") {
+            Some(event) => event,
+            None => return Vec::new(),
+        };
+
+        let sender_open_id = event
+            .pointer("/sender/sender_id/open_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let message: LarkMessage = match serde_json::from_value(
+            event
+                .get("message")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        ) {
+            Ok(message) => message,
+            Err(err) => {
+                tracing::warn!("Lark: failed to parse event message payload: {err}");
+                return Vec::new();
+            }
+        };
+
+        let Some(parsed) = self.parse_inbound_message(sender_open_id, &message) else {
+            return Vec::new();
+        };
+        self.parsed_to_channel_message(parsed)
+            .await
+            .into_iter()
+            .collect()
     }
 }
 
@@ -1393,49 +1704,49 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = super::strip_tool_call_tags(&message.content);
-        let (cleaned_content, parsed_attachments) = parse_lark_attachment_markers(&raw_content);
-        let (local_images, unresolved_markers) =
-            classify_lark_outgoing_attachments(&parsed_attachments);
+        let outbound = LarkOutboundRequest::from_send_message(message, &raw_content);
 
-        if !unresolved_markers.is_empty() {
+        if !outbound.unresolved_markers.is_empty() {
             tracing::warn!(
-                unresolved = ?unresolved_markers,
+                unresolved = ?outbound.unresolved_markers,
                 "lark: unresolved image attachment markers were sent as plain text"
             );
         }
 
-        let mut text_segments = Vec::new();
-        if !cleaned_content.is_empty() {
-            text_segments.push(cleaned_content);
-        }
-        if !unresolved_markers.is_empty() {
-            text_segments.extend(unresolved_markers);
-        }
-
-        if !local_images.is_empty() {
-            if !text_segments.is_empty() {
-                self.send_text_message(&message.recipient, &text_segments.join("\n"))
+        if outbound.has_local_attachments() {
+            if !outbound.text.is_empty() {
+                self.send_text_message(&outbound.target, &outbound.text)
                     .await?;
             }
 
-            for image_path in &local_images {
+            for image_path in &outbound.local_images {
                 let image_key = self.upload_image_with_retry(image_path).await?;
-                let body = build_lark_image_message_body(&message.recipient, &image_key);
+                let body = build_lark_image_message_body(&outbound.target, &image_key);
+                self.send_json_message(&body).await?;
+            }
+            for document_path in &outbound.local_documents {
+                let file_key = self.upload_file_with_retry(document_path).await?;
+                let body = build_lark_file_message_body(&outbound.target, &file_key);
                 self.send_json_message(&body).await?;
             }
             return Ok(());
         }
 
-        if let Some(attachment) = parse_lark_path_only_attachment(&raw_content) {
-            let image_key = self
-                .upload_image_with_retry(Path::new(&attachment.target))
-                .await?;
-            let body = build_lark_image_message_body(&message.recipient, &image_key);
+        if let Some((path, kind)) = outbound.attachment_path() {
+            let body = match kind {
+                LarkAttachmentKind::Image => {
+                    let image_key = self.upload_image_with_retry(path).await?;
+                    build_lark_image_message_body(&outbound.target, &image_key)
+                }
+                LarkAttachmentKind::Document => {
+                    let file_key = self.upload_file_with_retry(path).await?;
+                    build_lark_file_message_body(&outbound.target, &file_key)
+                }
+            };
             return self.send_json_message(&body).await;
         }
 
-        self.send_text_message(&message.recipient, &raw_content)
-            .await
+        self.send_text_message(&outbound.target, &raw_content).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -1492,7 +1803,7 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
+            let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1902,6 +2213,7 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::lark_inbound::{LarkInboundResource, LarkInboundResourceKind};
     use tempfile::TempDir;
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
@@ -2144,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn lark_parse_non_text_message_skipped() {
+    fn lark_parse_non_text_message_produces_media_placeholder() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2159,14 +2471,15 @@ mod tests {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
                     "message_type": "image",
-                    "content": "{}",
+                    "content": "{\"image_key\":\"img_v3_demo\"}",
                     "chat_id": "oc_chat"
                 }
             }
         });
 
         let msgs = ch.parse_event_payload(&payload);
-        assert!(msgs.is_empty());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "<media:image>");
     }
 
     #[test]
@@ -2178,6 +2491,80 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].kind, LarkAttachmentKind::Image);
         assert_eq!(attachments[0].target, "/tmp/snap.png");
+    }
+
+    #[test]
+    fn lark_parse_attachment_markers_extracts_local_documents() {
+        let (cleaned, attachments) =
+            parse_lark_attachment_markers("请发送 [DOCUMENT:/tmp/spec.pdf] 给对方");
+
+        assert_eq!(cleaned, "请发送  给对方");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, LarkAttachmentKind::Document);
+        assert_eq!(attachments[0].target, "/tmp/spec.pdf");
+    }
+
+    #[test]
+    fn lark_parse_inbound_image_resource_extracts_file_key() {
+        let resources = parse_lark_inbound_resources("image", "{\"image_key\":\"img_v3_demo\"}");
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].file_key, "img_v3_demo");
+        assert_eq!(
+            resources[0].kind.resource_type(),
+            "image",
+            "image resources should map to message resource type=image"
+        );
+    }
+
+    #[test]
+    fn lark_parse_inbound_file_resource_extracts_file_name() {
+        let resources = parse_lark_inbound_resources(
+            "file",
+            "{\"file_key\":\"file_v3_demo\",\"file_name\":\"report.pdf\"}",
+        );
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].file_key, "file_v3_demo");
+        assert_eq!(resources[0].file_name.as_deref(), Some("report.pdf"));
+    }
+
+    #[tokio::test]
+    async fn lark_store_inbound_resource_writes_to_account_scoped_path() {
+        let workspace = TempDir::new().unwrap();
+        let resource = LarkInboundResource {
+            kind: LarkInboundResourceKind::Image,
+            file_key: "img_v3_demo".to_string(),
+            file_name: Some("photo.png".to_string()),
+        };
+
+        let stored = store_inbound_resource(
+            workspace.path(),
+            "feishu",
+            "primary",
+            "om_123",
+            &resource,
+            b"\x89PNG\r\n\x1a\nfake",
+            Some("image/png"),
+            Some("photo.png"),
+        )
+        .await
+        .expect("resource should be written");
+
+        assert_eq!(stored.kind, LarkInboundResourceKind::Image);
+        assert!(
+            stored.path.exists(),
+            "stored path missing: {}",
+            stored.path.display()
+        );
+        assert!(
+            stored
+                .path
+                .to_string_lossy()
+                .contains("/channels/feishu/primary/inbound/"),
+            "stored path should be account-scoped: {}",
+            stored.path.display()
+        );
     }
 
     #[test]
@@ -2194,6 +2581,61 @@ mod tests {
     }
 
     #[test]
+    fn lark_parse_path_only_attachment_detects_document_file() {
+        let dir = TempDir::new().unwrap();
+        let doc_path = dir.path().join("spec.pdf");
+        std::fs::write(&doc_path, b"%PDF-1.4").unwrap();
+
+        let parsed = parse_lark_path_only_attachment(doc_path.to_string_lossy().as_ref())
+            .expect("expected document attachment");
+
+        assert_eq!(parsed.kind, LarkAttachmentKind::Document);
+        assert_eq!(parsed.target, doc_path.to_string_lossy());
+    }
+
+    #[test]
+    fn lark_outbound_request_collects_local_attachments_and_text() {
+        let dir = TempDir::new().unwrap();
+        let image_path = dir.path().join("screen.png");
+        let doc_path = dir.path().join("spec.pdf");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+        std::fs::write(&doc_path, b"%PDF-1.4").unwrap();
+
+        let content = format!(
+            "请先看图 [IMAGE:{}] 再读文件 [DOCUMENT:{}]",
+            image_path.display(),
+            doc_path.display()
+        );
+        let message = SendMessage::new(content.clone(), "oc_chat123");
+        let outbound = LarkOutboundRequest::from_send_message(&message, &content);
+
+        assert_eq!(outbound.target, "oc_chat123");
+        assert_eq!(outbound.local_images.len(), 1);
+        assert_eq!(outbound.local_documents.len(), 1);
+        assert!(
+            outbound.text.contains("请先看图"),
+            "text segments should preserve surrounding text"
+        );
+    }
+
+    #[test]
+    fn lark_outbound_request_detects_path_only_attachment() {
+        let dir = TempDir::new().unwrap();
+        let image_path = dir.path().join("cover.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        let raw = image_path.to_string_lossy().to_string();
+        let message = SendMessage::new(raw.clone(), "oc_chat123");
+        let outbound = LarkOutboundRequest::from_send_message(&message, &raw);
+
+        let (path, kind) = outbound
+            .attachment_path()
+            .expect("path-only attachment should be detected");
+        assert_eq!(kind, LarkAttachmentKind::Image);
+        assert_eq!(path, image_path.as_path());
+    }
+
+    #[test]
     fn lark_build_image_message_body_uses_image_key() {
         let body = build_lark_image_message_body("oc_chat123", "img_v3_key");
 
@@ -2202,6 +2644,18 @@ mod tests {
         assert_eq!(
             body["content"],
             serde_json::json!({ "image_key": "img_v3_key" }).to_string()
+        );
+    }
+
+    #[test]
+    fn lark_build_file_message_body_uses_file_key() {
+        let body = build_lark_file_message_body("oc_chat123", "file_v3_key");
+
+        assert_eq!(body["receive_id"], "oc_chat123");
+        assert_eq!(body["msg_type"], "file");
+        assert_eq!(
+            body["content"],
+            serde_json::json!({ "file_key": "file_v3_key" }).to_string()
         );
     }
 
@@ -2454,6 +2908,27 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+        assert_eq!(ch.account_id(), "default");
+    }
+
+    #[test]
+    fn lark_from_named_feishu_config_sets_account_identity() {
+        use crate::config::schema::{FeishuConfig, LarkReceiveMode};
+
+        let cfg = FeishuConfig {
+            app_id: "cli_feishu_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+
+        let ch = LarkChannel::from_named_feishu_config("feishu:primary".into(), &cfg);
+
+        assert_eq!(ch.name(), "feishu:primary");
+        assert_eq!(ch.account_id(), "primary");
     }
 
     #[test]

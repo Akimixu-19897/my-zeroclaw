@@ -23,6 +23,12 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+#[cfg(feature = "channel-lark")]
+pub(crate) mod lark_inbound;
+#[cfg(feature = "channel-lark")]
+pub(crate) mod lark_media;
+#[cfg(feature = "channel-lark")]
+pub(crate) mod lark_outbound;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
@@ -478,7 +484,8 @@ fn strip_tool_call_tags(message: &str) -> String {
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
-    match channel_name {
+    let normalized = channel_name.split(':').next().unwrap_or(channel_name);
+    match normalized {
         "matrix" => Some(
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
@@ -498,6 +505,34 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "feishu" => Some(
+            "When responding on Feishu:\n\
+             - Use channel attachment markers instead of writing one-off upload scripts.\n\
+             - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - For images use [IMAGE:<absolute-path-or-url>].\n\
+             - For files use [DOCUMENT:<absolute-path>] or [FILE:<absolute-path>].\n\
+             - Keep explanatory text outside markers and never wrap markers in code fences.\n\
+             - If a local file already exists in the workspace or on disk, reference it directly with a marker instead of re-uploading it manually from a tool.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "lark" => Some(
+            "When responding on Lark:\n\
+             - Use channel attachment markers instead of writing one-off upload scripts.\n\
+             - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - For images use [IMAGE:<absolute-path-or-url>].\n\
+             - For files use [DOCUMENT:<absolute-path>] or [FILE:<absolute-path>].\n\
+             - Keep explanatory text outside markers and never wrap markers in code fences.\n\
+             - If a local file already exists in the workspace or on disk, reference it directly with a marker instead of re-uploading it manually from a tool.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "wecom" => Some(
+            "When responding on WeCom:\n\
+             - Use channel attachment markers instead of writing one-off upload scripts.\n\
+             - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - For images use [IMAGE:<absolute-path-or-url>].\n\
+             - Keep explanatory text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         _ => None,
@@ -3104,13 +3139,19 @@ fn collect_configured_channels(
                 );
                 channels.push(ConfiguredChannel {
                     display_name: "Feishu".to_string(),
-                    channel: Arc::new(LarkChannel::from_config(lk)),
+                    channel: Arc::new(
+                        LarkChannel::from_config(lk)
+                            .with_workspace_dir(Some(config.workspace_dir.clone())),
+                    ),
                 });
             }
         } else {
             channels.push(ConfiguredChannel {
                 display_name: "Lark".to_string(),
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
+                channel: Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_workspace_dir(Some(config.workspace_dir.clone())),
+                ),
             });
         }
     }
@@ -3119,7 +3160,10 @@ fn collect_configured_channels(
     if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
             display_name: "Feishu".to_string(),
-            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
+            channel: Arc::new(
+                LarkChannel::from_feishu_config(fs)
+                    .with_workspace_dir(Some(config.workspace_dir.clone())),
+            ),
         });
     }
 
@@ -3127,10 +3171,10 @@ fn collect_configured_channels(
     for (account, fs) in &config.channels_config.feishu_accounts {
         channels.push(ConfiguredChannel {
             display_name: format!("Feishu[{account}]"),
-            channel: Arc::new(LarkChannel::from_named_feishu_config(
-                format!("feishu:{account}"),
-                fs,
-            )),
+            channel: Arc::new(
+                LarkChannel::from_named_feishu_config(format!("feishu:{account}"), fs)
+                    .with_workspace_dir(Some(config.workspace_dir.clone())),
+            ),
         });
     }
 
@@ -3147,16 +3191,20 @@ fn collect_configured_channels(
     if let Some(ref wecom) = config.channels_config.wecom {
         channels.push(ConfiguredChannel {
             display_name: "WeCom".to_string(),
-            channel: Arc::new(WeComChannel::from_config(wecom)),
+            channel: Arc::new(WeComChannel::from_config_with_workspace(
+                wecom,
+                config.workspace_dir.clone(),
+            )),
         });
     }
 
     for (account, wecom) in &config.channels_config.wecom_accounts {
         channels.push(ConfiguredChannel {
             display_name: format!("WeCom[{account}]"),
-            channel: Arc::new(WeComChannel::from_named_config(
+            channel: Arc::new(WeComChannel::from_named_config_with_workspace(
                 format!("wecom:{account}"),
                 wecom,
+                Some(config.workspace_dir.clone()),
             )),
         });
     }
@@ -6224,6 +6272,39 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn build_channel_system_prompt_includes_feishu_attachment_marker_guidance() {
+        let prompt = build_channel_system_prompt("base", "feishu", "oc_chat123");
+
+        assert!(
+            prompt.contains("When responding on Feishu:"),
+            "feishu channel instructions should be embedded into the system prompt"
+        );
+        assert!(
+            prompt.contains("[IMAGE:<absolute-path-or-url>]"),
+            "feishu image marker guidance should be present"
+        );
+        assert!(
+            prompt.contains("[DOCUMENT:<absolute-path>]"),
+            "feishu document marker guidance should be present"
+        );
+        assert!(
+            prompt.contains("Do not write ad-hoc upload scripts"),
+            "agent should be explicitly told not to create workaround scripts"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_named_feishu_attachment_marker_guidance() {
+        let prompt = build_channel_system_prompt("base", "feishu:primary", "oc_chat123");
+
+        assert!(
+            prompt.contains("When responding on Feishu:"),
+            "named feishu channels should still receive feishu attachment guidance"
+        );
+        assert!(prompt.contains("[DOCUMENT:<absolute-path>]"));
+    }
+
+    #[test]
     fn extract_tool_context_summary_collects_prompt_mode_tool_result_names() {
         let history = vec![
             ChatMessage::system("sys"),
@@ -6725,7 +6806,9 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn wecom_does_not_thread_tool_updates_via_message_id() {
         assert!(!should_forward_tool_events_as_thread_messages("wecom"));
-        assert!(!should_forward_tool_events_as_thread_messages("wecom:primary"));
+        assert!(!should_forward_tool_events_as_thread_messages(
+            "wecom:primary"
+        ));
 
         let msg = traits::ChannelMessage {
             id: "wecom-msg-1".to_string(),
