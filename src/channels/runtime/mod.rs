@@ -1,0 +1,15 @@
+pub(crate) mod commands;
+pub(crate) mod config;
+pub(crate) mod dispatch;
+pub(crate) mod keys;
+pub(crate) mod lifecycle;
+pub(crate) mod notify;
+pub(crate) mod processing;
+pub(crate) mod processing_approval;
+pub(crate) mod processing_result;
+pub(crate) mod processing_support;
+pub(crate) mod prompt;
+pub(crate) mod prompt_builder;
+pub(crate) mod registry;
+pub(crate) mod routing;
+pub(crate) mod text;

@@ -13,8 +13,8 @@ const MAX_OUTPUT_CHARS: usize = 200_000;
 
 /// Extract plain text from a PDF file in the workspace.
 ///
-/// PDF extraction requires the `rag-pdf` feature flag:
-///   cargo build --features rag-pdf
+/// PDF extraction is enabled by default via the `rag-pdf` feature.
+/// If you disable default features, rebuild with `--features rag-pdf`.
 ///
 /// Without the feature the tool is still registered so the LLM receives a
 /// clear, actionable error rather than a missing-tool confusion.
@@ -37,7 +37,7 @@ impl Tool for PdfReadTool {
     fn description(&self) -> &str {
         "Extract plain text from a PDF file in the workspace. \
          Returns all readable text. Image-only or encrypted PDFs return an empty result. \
-         Requires the 'rag-pdf' build feature."
+         Enabled by default; requires the 'rag-pdf' build feature only when default features are disabled."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -219,7 +219,7 @@ impl Tool for PdfReadTool {
                 success: false,
                 output: String::new(),
                 error: Some(
-                    "PDF extraction is not enabled. \
+                    "PDF extraction is not enabled in this build. \
                      Rebuild with: cargo build --features rag-pdf"
                         .into(),
                 ),

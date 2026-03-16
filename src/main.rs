@@ -480,9 +480,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or Feishu)
     Login {
-        /// Provider (`openai-codex` or `gemini`)
+        /// Provider (`openai-codex`, `gemini`, or `feishu`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -494,7 +494,7 @@ enum AuthCommands {
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex`, `gemini`, or `feishu`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -528,9 +528,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh provider access token using refresh token
     Refresh {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex`, `gemini`, or `feishu`)
         #[arg(long)]
         provider: String,
         /// Profile name or profile id
@@ -594,6 +594,12 @@ enum ModelCommands {
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
+    /// Run Feishu/Lark specific diagnostics and live checks
+    Feishu {
+        /// Inspect a specific named Feishu account only
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Probe model catalogs across providers and report availability
     Models {
         /// Probe a specific provider only (default: all known providers)
@@ -1112,6 +1118,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {
+            Some(DoctorCommands::Feishu { account }) => {
+                doctor::feishu::run_feishu(&config, account.as_deref()).await
+            }
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
@@ -1785,9 +1794,60 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Active profile for openai-codex: {profile}");
                     Ok(())
                 }
+                "feishu" => {
+                    if device_code {
+                        println!(
+                            "Feishu device-code flow is not implemented; falling back to browser flow."
+                        );
+                    }
+
+                    let pkce = auth::feishu_oauth::generate_pkce_state();
+                    let authorize_url = auth::feishu_oauth::build_authorize_url(&pkce)?;
+
+                    let pending = PendingOAuthLogin {
+                        provider: "feishu".to_string(),
+                        profile: profile.clone(),
+                        code_verifier: pkce.code_verifier.clone(),
+                        state: pkce.state.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    save_pending_oauth_login(config, &pending)?;
+
+                    println!("Open this URL in your browser and authorize access:");
+                    println!("{authorize_url}");
+                    println!();
+                    println!("Waiting for callback at http://localhost:1457/auth/callback ...");
+
+                    let code = match auth::feishu_oauth::receive_loopback_code(
+                        &pkce.state,
+                        std::time::Duration::from_secs(180),
+                    )
+                    .await
+                    {
+                        Ok(code) => code,
+                        Err(e) => {
+                            println!("Callback capture failed: {e}");
+                            println!(
+                                "Run `zeroclaw auth paste-redirect --provider feishu --profile {profile}`"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    let token_set =
+                        auth::feishu_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    auth_service
+                        .store_feishu_tokens(&profile, token_set, None, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "feishu");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for feishu: {profile}");
+                    Ok(())
+                }
                 _ => {
                     bail!(
-                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
+                        "`auth login` supports --provider openai-codex, gemini, or feishu, got: {provider}"
                     );
                 }
             }
@@ -1892,8 +1952,53 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Saved profile {profile}");
                     println!("Active profile for gemini: {profile}");
                 }
+                "feishu" => {
+                    let pending = load_pending_oauth_login(config, "feishu")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending Feishu login found. Run `zeroclaw auth login --provider feishu` first."
+                        )
+                    })?;
+
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
+                    }
+
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::feishu_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::feishu_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::feishu_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+
+                    auth_service
+                        .store_feishu_tokens(&profile, token_set, None, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "feishu");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for feishu: {profile}");
+                }
                 _ => {
-                    bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
+                    bail!(
+                        "`auth paste-redirect` supports --provider openai-codex, gemini, or feishu"
+                    );
                 }
             }
             Ok(())
@@ -1989,7 +2094,23 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                     }
                 }
-                _ => bail!("`auth refresh` supports --provider openai-codex or gemini"),
+                "feishu" => match auth_service
+                    .get_valid_feishu_access_token(profile.as_deref())
+                    .await?
+                {
+                    Some(_) => {
+                        let profile_name = profile.as_deref().unwrap_or("default");
+                        println!("✓ Feishu token refreshed successfully");
+                        println!("  Profile: feishu:{}", profile_name);
+                        Ok(())
+                    }
+                    None => {
+                        bail!(
+                            "No Feishu auth profile found. Run `zeroclaw auth login --provider feishu`."
+                        )
+                    }
+                },
+                _ => bail!("`auth refresh` supports --provider openai-codex, gemini, or feishu"),
             }
         }
 

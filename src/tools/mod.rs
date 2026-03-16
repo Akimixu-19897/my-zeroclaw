@@ -27,6 +27,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod feishu;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -51,6 +52,8 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+#[cfg(test)]
+mod tests;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
@@ -66,6 +69,11 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use feishu::{
+    FeishuBitableTool, FeishuCalendarTool, FeishuDocCreateTool, FeishuDocFetchTool,
+    FeishuDocUpdateTool, FeishuDriveFileTool, FeishuImMessageTool, FeishuImReadTool,
+    FeishuImResourceTool, FeishuSearchTool, FeishuSheetsTool, FeishuTaskTool, FeishuWikiSpaceTool,
+};
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -241,6 +249,12 @@ pub fn all_tools_with_runtime(
         )),
     ];
 
+    if root_config.channels_config.feishu.is_some()
+        || !root_config.channels_config.feishu_accounts.is_empty()
+    {
+        feishu::append_feishu_tools(&mut tool_arcs, &config, workspace_dir);
+    }
+
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
@@ -297,7 +311,7 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // PDF extraction (feature-gated at compile time via rag-pdf)
+    // PDF extraction (enabled in default builds via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
     // Vision tools are always available
@@ -346,289 +360,4 @@ pub fn all_tools_with_runtime(
     }
 
     boxed_registry_from_arcs(tool_arcs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig};
-    use tempfile::TempDir;
-
-    fn test_config(tmp: &TempDir) -> Config {
-        Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        }
-    }
-
-    #[test]
-    fn default_tools_has_expected_count() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
-    }
-
-    #[test]
-    fn all_tools_excludes_browser_when_disabled() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig {
-            enabled: false,
-            allowed_domains: vec!["example.com".into()],
-            session_name: None,
-            ..BrowserConfig::default()
-        };
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"browser_open"));
-        assert!(names.contains(&"schedule"));
-        assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"proxy_config"));
-    }
-
-    #[test]
-    fn all_tools_includes_browser_when_enabled() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig {
-            enabled: true,
-            allowed_domains: vec!["example.com".into()],
-            session_name: None,
-            ..BrowserConfig::default()
-        };
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"browser_open"));
-        assert!(names.contains(&"content_search"));
-        assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"proxy_config"));
-    }
-
-    #[test]
-    fn default_tools_names() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"file_read"));
-        assert!(names.contains(&"file_write"));
-        assert!(names.contains(&"file_edit"));
-        assert!(names.contains(&"glob_search"));
-        assert!(names.contains(&"content_search"));
-    }
-
-    #[test]
-    fn default_tools_all_have_descriptions() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        for tool in &tools {
-            assert!(
-                !tool.description().is_empty(),
-                "Tool {} has empty description",
-                tool.name()
-            );
-        }
-    }
-
-    #[test]
-    fn default_tools_all_have_schemas() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        for tool in &tools {
-            let schema = tool.parameters_schema();
-            assert!(
-                schema.is_object(),
-                "Tool {} schema is not an object",
-                tool.name()
-            );
-            assert!(
-                schema["properties"].is_object(),
-                "Tool {} schema has no properties",
-                tool.name()
-            );
-        }
-    }
-
-    #[test]
-    fn tool_spec_generation() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        for tool in &tools {
-            let spec = tool.spec();
-            assert_eq!(spec.name, tool.name());
-            assert_eq!(spec.description, tool.description());
-            assert!(spec.parameters.is_object());
-        }
-    }
-
-    #[test]
-    fn tool_result_serde() {
-        let result = ToolResult {
-            success: true,
-            output: "hello".into(),
-            error: None,
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
-        assert!(parsed.success);
-        assert_eq!(parsed.output, "hello");
-        assert!(parsed.error.is_none());
-    }
-
-    #[test]
-    fn tool_result_with_error_serde() {
-        let result = ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some("boom".into()),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.success);
-        assert_eq!(parsed.error.as_deref(), Some("boom"));
-    }
-
-    #[test]
-    fn tool_spec_serde() {
-        let spec = ToolSpec {
-            name: "test".into(),
-            description: "A test tool".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        };
-        let json = serde_json::to_string(&spec).unwrap();
-        let parsed: ToolSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.name, "test");
-        assert_eq!(parsed.description, "A test tool");
-    }
-
-    #[test]
-    fn all_tools_includes_delegate_when_agents_configured() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-            },
-        );
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &agents,
-            Some("delegate-test-credential"),
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"delegate"));
-    }
-
-    #[test]
-    fn all_tools_excludes_delegate_when_no_agents() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"delegate"));
-    }
 }

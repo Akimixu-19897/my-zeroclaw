@@ -70,6 +70,7 @@ mod tests {
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
+            enabled: None,
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],

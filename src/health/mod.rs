@@ -12,6 +12,7 @@ pub struct ComponentHealth {
     pub last_ok: Option<String>,
     pub last_error: Option<String>,
     pub restart_count: u64,
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +55,7 @@ where
             last_ok: None,
             last_error: None,
             restart_count: 0,
+            details: None,
         });
     update(entry);
     entry.updated_at = now;
@@ -79,6 +81,12 @@ pub fn mark_component_error(component: &str, error: impl ToString) {
 pub fn bump_component_restart(component: &str) {
     upsert_component(component, |entry| {
         entry.restart_count = entry.restart_count.saturating_add(1);
+    });
+}
+
+pub fn set_component_details(component: &str, details: serde_json::Value) {
+    upsert_component(component, move |entry| {
+        entry.details = Some(details);
     });
 }
 
@@ -125,6 +133,7 @@ mod tests {
         assert_eq!(entry.status, "ok");
         assert!(entry.last_ok.is_some());
         assert!(entry.last_error.is_none());
+        assert!(entry.details.is_none());
     }
 
     #[test]
@@ -180,5 +189,24 @@ mod tests {
         assert!(component_json["updated_at"].as_str().is_some());
         assert!(component_json["last_ok"].as_str().is_some());
         assert!(json["uptime_seconds"].as_u64().is_some());
+    }
+
+    #[test]
+    fn set_component_details_persists_probe_metadata() {
+        let component = unique_component("health-details");
+
+        set_component_details(
+            &component,
+            serde_json::json!({
+                "platform": "feishu",
+                "token_status": "ok"
+            }),
+        );
+
+        let json = snapshot_json();
+        let details = &json["components"][&component]["details"];
+
+        assert_eq!(details["platform"], "feishu");
+        assert_eq!(details["token_status"], "ok");
     }
 }

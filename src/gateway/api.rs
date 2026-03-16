@@ -1069,6 +1069,7 @@ mod tests {
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_aabbcc".to_string(),
             app_secret: "feishu-secret".to_string(),
+            enabled: None,
             encrypt_key: Some("feishu-encrypt".to_string()),
             verification_token: Some("feishu-verify".to_string()),
             allowed_users: vec!["*".to_string()],
@@ -1080,6 +1081,7 @@ mod tests {
             crate::config::schema::FeishuConfig {
                 app_id: "cli_ops".to_string(),
                 app_secret: "feishu-secret-ops".to_string(),
+                enabled: None,
                 encrypt_key: Some("feishu-encrypt-ops".to_string()),
                 verification_token: Some("feishu-verify-ops".to_string()),
                 allowed_users: vec!["*".to_string()],
@@ -1269,6 +1271,7 @@ mod tests {
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_current".to_string(),
             app_secret: "feishu-secret-real".to_string(),
+            enabled: None,
             encrypt_key: Some("feishu-encrypt-real".to_string()),
             verification_token: Some("feishu-verify-real".to_string()),
             allowed_users: vec!["*".to_string()],
@@ -1280,6 +1283,7 @@ mod tests {
             crate::config::schema::FeishuConfig {
                 app_id: "cli_ops".to_string(),
                 app_secret: "feishu-secret-ops-real".to_string(),
+                enabled: None,
                 encrypt_key: Some("feishu-encrypt-ops-real".to_string()),
                 verification_token: Some("feishu-verify-ops-real".to_string()),
                 allowed_users: vec!["*".to_string()],

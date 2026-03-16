@@ -1,4 +1,20 @@
 use async_trait::async_trait;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ChannelMessageContext {
+    pub sender_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub chat_type: Option<String>,
+    pub content_type: Option<String>,
+    pub raw_content: Option<String>,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub origin_from: Option<String>,
+    pub origin_to: Option<String>,
+    pub envelope_from: Option<String>,
+}
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -12,6 +28,8 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Optional normalized transport metadata preserved from the inbound platform event.
+    pub context: Option<ChannelMessageContext>,
 }
 
 /// Message to send through a channel
@@ -182,6 +200,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                context: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +217,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            context: None,
         };
 
         let cloned = message.clone();

@@ -442,16 +442,16 @@ fn resolve_feishu_delivery_account<'a>(
     account: Option<&str>,
 ) -> Result<(String, &'a crate::config::schema::FeishuConfig)> {
     if let Some(account_id) = account {
-        let trimmed = account_id.trim();
-        if trimmed.is_empty() {
+        if account_id.trim().is_empty() {
             anyhow::bail!("delivery.account for feishu cannot be empty");
         }
-        let cfg = config
+        let Some((channel_name, _, cfg)) = config
             .channels_config
-            .feishu_accounts
-            .get(trimmed)
-            .ok_or_else(|| anyhow::anyhow!("feishu account not configured: {trimmed}"))?;
-        return Ok((format!("feishu:{trimmed}"), cfg));
+            .resolve_feishu_account_reference(Some(account_id))
+        else {
+            anyhow::bail!("feishu account not configured: {}", account_id.trim());
+        };
+        return Ok((channel_name, cfg));
     }
 
     if let Some(cfg) = config.channels_config.feishu.as_ref() {
@@ -1132,6 +1132,7 @@ mod tests {
         config.channels_config.feishu = Some(crate::config::FeishuConfig {
             app_id: "cli_test".into(),
             app_secret: "secret".into(),
+            enabled: None,
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
@@ -1159,6 +1160,7 @@ mod tests {
             crate::config::schema::FeishuConfig {
                 app_id: "cli_test".into(),
                 app_secret: "secret".into(),
+                enabled: None,
                 encrypt_key: None,
                 verification_token: None,
                 allowed_users: vec!["*".into()],
@@ -1178,6 +1180,40 @@ mod tests {
 
     #[cfg(feature = "channel-lark")]
     #[tokio::test]
+    async fn deliver_announcement_accepts_prefixed_named_feishu_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.feishu_accounts.insert(
+            "ops".into(),
+            crate::config::schema::FeishuConfig {
+                app_id: "cli_test".into(),
+                app_secret: "secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let err = deliver_announcement(
+            &config,
+            "feishu",
+            Some(" Feishu:OPS "),
+            "oc_test_target",
+            "hello",
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("unsupported delivery channel"));
+        assert!(!text.contains("multiple feishu accounts configured"));
+        assert!(!text.contains("feishu account not configured"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[tokio::test]
     async fn deliver_announcement_requires_account_when_multiple_feishu_accounts_exist() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1187,6 +1223,7 @@ mod tests {
                 crate::config::schema::FeishuConfig {
                     app_id: format!("cli_{account}"),
                     app_secret: "secret".into(),
+                    enabled: None,
                     encrypt_key: None,
                     verification_token: None,
                     allowed_users: vec!["*".into()],

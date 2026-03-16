@@ -465,6 +465,7 @@ impl WeComChannel {
             channel: channel_name.to_string(),
             timestamp: current_timestamp_secs(),
             thread_ts: Some(headers.req_id),
+            context: None,
         })
     }
 
@@ -513,6 +514,7 @@ impl WeComChannel {
             channel: channel_name.to_string(),
             timestamp: current_timestamp_secs(),
             thread_ts: Some(headers.req_id),
+            context: None,
         })
     }
 
@@ -1335,8 +1337,14 @@ mod tests {
         assert!(req_id.split('_').count() >= 4);
     }
 
+    fn wecom_image_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn parse_inbound_image_message_downloads_to_workspace() {
+        let _guard = wecom_image_test_lock().lock().await;
         let image_bytes = base64::engine::general_purpose::STANDARD
             .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=")
             .unwrap();
@@ -1396,6 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_inbound_mixed_message_combines_images_and_text() {
+        let _guard = wecom_image_test_lock().lock().await;
         let image_bytes = base64::engine::general_purpose::STANDARD
             .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=")
             .unwrap();

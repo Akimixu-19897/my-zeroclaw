@@ -306,13 +306,13 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
         (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
         (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
         (Some(channel), Some(target)) => {
-            validate_heartbeat_channel_config(config, channel)?;
-            Ok(Some((channel.to_string(), target.to_string())))
+            let normalized_channel = validate_heartbeat_channel_config(config, channel)?;
+            Ok(Some((normalized_channel, target.to_string())))
         }
     }
 }
 
-fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
+fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<String> {
     let normalized = channel.trim().to_ascii_lowercase();
     let (base, account) = normalized
         .split_once(':')
@@ -327,6 +327,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to telegram but channels_config.telegram is not configured"
                 );
             }
+            Ok("telegram".to_string())
         }
         "discord" => {
             if config.channels_config.discord.is_none() {
@@ -334,6 +335,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to discord but channels_config.discord is not configured"
                 );
             }
+            Ok("discord".to_string())
         }
         "slack" => {
             if config.channels_config.slack.is_none() {
@@ -341,6 +343,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to slack but channels_config.slack is not configured"
                 );
             }
+            Ok("slack".to_string())
         }
         "mattermost" => {
             if config.channels_config.mattermost.is_none() {
@@ -348,6 +351,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
                 );
             }
+            Ok("mattermost".to_string())
         }
         "lark" => {
             if config.channels_config.lark.is_none() {
@@ -355,14 +359,19 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to lark but channels_config.lark is not configured"
                 );
             }
+            Ok("lark".to_string())
         }
         "feishu" => match account {
             Some(account) if !account.is_empty() => {
-                if !config.channels_config.feishu_accounts.contains_key(account) {
+                let Some((channel_name, _, _)) = config
+                    .channels_config
+                    .resolve_feishu_account_reference(Some(account))
+                else {
                     anyhow::bail!(
                             "heartbeat.target is set to feishu:{account} but channels_config.feishu_accounts.{account} is not configured"
                         );
-                }
+                };
+                Ok(channel_name)
             }
             Some(_) => anyhow::bail!("heartbeat.target feishu account cannot be empty"),
             None => {
@@ -371,6 +380,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                             "heartbeat.target is set to feishu but channels_config.feishu is not configured"
                         );
                 }
+                Ok("feishu".to_string())
             }
         },
         "wecom" => match account {
@@ -380,6 +390,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                             "heartbeat.target is set to wecom:{account} but channels_config.wecom_accounts.{account} is not configured"
                         );
                 }
+                Ok(format!("wecom:{account}"))
             }
             Some(_) => anyhow::bail!("heartbeat.target wecom account cannot be empty"),
             None => {
@@ -388,12 +399,11 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                             "heartbeat.target is set to wecom but channels_config.wecom is not configured"
                         );
                 }
+                Ok("wecom".to_string())
             }
         },
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
-
-    Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -629,6 +639,7 @@ mod tests {
         config.channels_config.feishu = Some(crate::config::FeishuConfig {
             app_id: "cli_test".into(),
             app_secret: "secret".into(),
+            enabled: None,
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
@@ -653,6 +664,33 @@ mod tests {
             crate::config::FeishuConfig {
                 app_id: "cli_ops".into(),
                 app_secret: "secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("feishu:ops".to_string(), "oc_ops_target".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_prefixed_named_feishu_account() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some(" Feishu:OPS ".into());
+        config.heartbeat.to = Some("oc_ops_target".into());
+        config.channels_config.feishu_accounts.insert(
+            "ops".into(),
+            crate::config::FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "secret".into(),
+                enabled: None,
                 encrypt_key: None,
                 verification_token: None,
                 allowed_users: vec!["*".into()],

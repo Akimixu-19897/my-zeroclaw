@@ -2773,7 +2773,152 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
+pub struct ResolvedFeishuAccount<'a> {
+    pub account_id: String,
+    pub channel_name: String,
+    pub configured: bool,
+    pub enabled: bool,
+    pub config: Option<&'a FeishuConfig>,
+}
+
 impl ChannelsConfig {
+    pub fn normalize_feishu_account_reference(account: &str) -> Option<String> {
+        let trimmed = account.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        for prefix in ["feishu:", "lark:"] {
+            if trimmed.len() > prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            {
+                let account = trimmed[prefix.len()..].trim();
+                return (!account.is_empty()).then(|| account.to_string());
+            }
+        }
+
+        Some(trimmed.to_string())
+    }
+
+    pub fn feishu_account_ids(&self) -> Vec<String> {
+        if self.feishu_accounts.is_empty() {
+            return vec!["default".to_string()];
+        }
+
+        let mut account_ids = Vec::new();
+        if self.feishu.is_some() {
+            account_ids.push("default".to_string());
+        }
+        account_ids.extend(self.feishu_accounts.keys().cloned());
+        account_ids
+    }
+
+    pub fn default_feishu_account_id(&self) -> String {
+        self.feishu_account_ids()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    pub fn configured_feishu_account_ids(&self) -> Vec<String> {
+        self.feishu_account_ids()
+            .into_iter()
+            .filter(|account_id| {
+                self.resolve_feishu_account_profile(Some(account_id))
+                    .configured
+            })
+            .collect()
+    }
+
+    pub fn resolve_feishu_account_reference(
+        &self,
+        account: Option<&str>,
+    ) -> Option<(String, String, &FeishuConfig)> {
+        let requested = account.and_then(Self::normalize_feishu_account_reference);
+
+        if let Some(requested) = requested {
+            if requested.eq_ignore_ascii_case("default") || requested.eq_ignore_ascii_case("feishu")
+            {
+                return self
+                    .feishu
+                    .as_ref()
+                    .map(|cfg| ("feishu".to_string(), "default".to_string(), cfg));
+            }
+
+            if let Some((name, cfg)) = self
+                .feishu_accounts
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&requested))
+            {
+                return Some((format!("feishu:{name}"), name.clone(), cfg));
+            }
+
+            return None;
+        }
+
+        if let Some(cfg) = self.feishu.as_ref() {
+            return Some(("feishu".to_string(), "default".to_string(), cfg));
+        }
+
+        self.feishu_accounts
+            .iter()
+            .next()
+            .map(|(name, cfg)| (format!("feishu:{name}"), name.clone(), cfg))
+    }
+
+    pub fn resolve_feishu_account_profile(
+        &self,
+        account: Option<&str>,
+    ) -> ResolvedFeishuAccount<'_> {
+        let requested = account
+            .and_then(Self::normalize_feishu_account_reference)
+            .unwrap_or_else(|| "default".to_string());
+
+        if let Some((channel_name, account_id, cfg)) =
+            self.resolve_feishu_account_reference(account)
+        {
+            let configured = !cfg.app_id.trim().is_empty() && !cfg.app_secret.trim().is_empty();
+            let enabled = cfg.enabled.unwrap_or(configured);
+            return ResolvedFeishuAccount {
+                account_id,
+                channel_name,
+                configured,
+                enabled,
+                config: Some(cfg),
+            };
+        }
+
+        let account_id = if requested.eq_ignore_ascii_case("feishu")
+            || requested.eq_ignore_ascii_case("default")
+        {
+            "default".to_string()
+        } else {
+            requested
+        };
+
+        ResolvedFeishuAccount {
+            channel_name: if account_id == "default" {
+                "feishu".to_string()
+            } else {
+                format!("feishu:{account_id}")
+            },
+            account_id,
+            configured: false,
+            enabled: false,
+            config: None,
+        }
+    }
+
+    pub fn enabled_feishu_accounts(&self) -> Vec<ResolvedFeishuAccount<'_>> {
+        let mut accounts = Vec::new();
+        for account_id in self.feishu_account_ids() {
+            let resolved = self.resolve_feishu_account_profile(Some(&account_id));
+            if resolved.enabled && resolved.configured {
+                accounts.push(resolved);
+            }
+        }
+        accounts
+    }
+
     /// get channels' metadata and `.is_some()`, except webhook
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
@@ -3391,6 +3536,9 @@ pub struct FeishuConfig {
     pub app_id: String,
     /// App Secret from Feishu developer console
     pub app_secret: String,
+    /// Explicit enablement for this account. When unset, runtime derives enablement from credentials.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// Encrypt key for webhook message decryption (optional)
     #[serde(default)]
     pub encrypt_key: Option<String>,
@@ -3921,6 +4069,16 @@ async fn load_persisted_workspace_dirs(
     } else {
         default_config_dir.join(parsed_dir)
     };
+
+    if is_temp_directory(&config_dir) {
+        tracing::warn!(
+            path = %config_dir.display(),
+            marker = %state_path.display(),
+            "Ignoring active workspace marker because it points to a temp directory"
+        );
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
@@ -7555,6 +7713,48 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn load_or_init_ignores_persisted_temp_active_workspace_marker() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = temp_home.join(".zeroclaw");
+        let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let temp_marker_dir =
+            std::env::temp_dir().join(format!("zeroclaw_temp_marker_{}", uuid::Uuid::new_v4()));
+
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        fs::write(
+            default_config_dir.join("config.toml"),
+            "default_temperature = 0.7\ndefault_model = \"default-profile\"\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &marker_path,
+            format!("config_dir = \"{}\"\n", temp_marker_dir.display()),
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let config = Config::load_or_init().await.unwrap();
+
+        assert_eq!(config.config_path, default_config_dir.join("config.toml"));
+        assert_eq!(config.workspace_dir, default_config_dir.join("workspace"));
+        assert_eq!(config.default_model.as_deref(), Some("default-profile"));
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn load_or_init_env_workspace_override_takes_priority_over_marker() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -8084,6 +8284,7 @@ default_model = "legacy-model"
         let fc = FeishuConfig {
             app_id: "cli_feishu_123".into(),
             app_secret: "secret_abc".into(),
+            enabled: None,
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
@@ -8104,6 +8305,7 @@ default_model = "legacy-model"
         let fc = FeishuConfig {
             app_id: "cli_feishu_123".into(),
             app_secret: "secret_abc".into(),
+            enabled: None,
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
@@ -8137,6 +8339,7 @@ default_model = "legacy-model"
             FeishuConfig {
                 app_id: "cli_feishu_123".into(),
                 app_secret: "secret".into(),
+                enabled: None,
                 encrypt_key: None,
                 verification_token: None,
                 allowed_users: vec!["*".into()],
@@ -8149,6 +8352,286 @@ default_model = "legacy-model"
             .channels_except_webhook()
             .iter()
             .any(|(handle, ok)| handle.name() == "Feishu" && *ok));
+    }
+
+    #[test]
+    async fn configured_feishu_account_ids_put_default_before_named_accounts() {
+        let mut c = ChannelsConfig::default();
+        c.feishu = Some(FeishuConfig {
+            app_id: "cli_default".into(),
+            app_secret: "secret".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        assert_eq!(
+            c.configured_feishu_account_ids(),
+            vec!["default".to_string(), "ops".to_string()]
+        );
+    }
+
+    #[test]
+    async fn resolve_feishu_account_reference_prefers_default_when_unspecified() {
+        let mut c = ChannelsConfig::default();
+        c.feishu = Some(FeishuConfig {
+            app_id: "cli_default".into(),
+            app_secret: "secret".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let (channel_name, resolved_name, cfg) = c
+            .resolve_feishu_account_reference(None)
+            .expect("default account");
+
+        assert_eq!(channel_name, "feishu");
+        assert_eq!(resolved_name, "default");
+        assert_eq!(cfg.app_id, "cli_default");
+    }
+
+    #[test]
+    async fn resolve_feishu_account_reference_accepts_prefixed_named_account() {
+        let mut c = ChannelsConfig::default();
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let (channel_name, resolved_name, cfg) = c
+            .resolve_feishu_account_reference(Some(" Feishu:OPS "))
+            .expect("named account");
+
+        assert_eq!(channel_name, "feishu:ops");
+        assert_eq!(resolved_name, "ops");
+        assert_eq!(cfg.app_id, "cli_ops");
+    }
+
+    #[test]
+    async fn resolve_feishu_account_profile_returns_unconfigured_default_when_missing() {
+        let c = ChannelsConfig::default();
+
+        let resolved = c.resolve_feishu_account_profile(None);
+
+        assert_eq!(resolved.account_id, "default");
+        assert_eq!(resolved.channel_name, "feishu");
+        assert!(!resolved.configured);
+        assert!(!resolved.enabled);
+        assert!(resolved.config.is_none());
+    }
+
+    #[test]
+    async fn enabled_feishu_accounts_filters_out_unconfigured_entries() {
+        let mut c = ChannelsConfig::default();
+        c.feishu = Some(FeishuConfig {
+            app_id: "".into(),
+            app_secret: "".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let enabled = c.enabled_feishu_accounts();
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].account_id, "ops");
+        assert_eq!(enabled[0].channel_name, "feishu:ops");
+    }
+
+    #[test]
+    async fn feishu_account_ids_include_default_placeholder_when_unconfigured() {
+        let c = ChannelsConfig::default();
+
+        assert_eq!(c.feishu_account_ids(), vec!["default".to_string()]);
+        assert_eq!(c.default_feishu_account_id(), "default");
+    }
+
+    #[test]
+    async fn feishu_account_ids_include_default_before_named_when_default_configured() {
+        let mut c = ChannelsConfig::default();
+        c.feishu = Some(FeishuConfig {
+            app_id: "cli_default".into(),
+            app_secret: "secret".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        assert_eq!(
+            c.feishu_account_ids(),
+            vec!["default".to_string(), "ops".to_string()]
+        );
+        assert_eq!(c.default_feishu_account_id(), "default");
+    }
+
+    #[test]
+    async fn resolve_feishu_account_profile_does_not_fall_back_to_other_account() {
+        let mut c = ChannelsConfig::default();
+        c.feishu = Some(FeishuConfig {
+            app_id: "cli_default".into(),
+            app_secret: "secret".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let resolved = c.resolve_feishu_account_profile(Some("sales"));
+
+        assert_eq!(resolved.account_id, "sales");
+        assert_eq!(resolved.channel_name, "feishu:sales");
+        assert!(!resolved.configured);
+        assert!(!resolved.enabled);
+        assert!(resolved.config.is_none());
+    }
+
+    #[test]
+    async fn resolve_feishu_account_profile_respects_explicit_enabled_false() {
+        let mut c = ChannelsConfig::default();
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: Some(false),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let resolved = c.resolve_feishu_account_profile(Some("ops"));
+
+        assert_eq!(resolved.account_id, "ops");
+        assert!(resolved.configured);
+        assert!(!resolved.enabled);
+    }
+
+    #[test]
+    async fn enabled_feishu_accounts_filters_out_explicitly_disabled_entries() {
+        let mut c = ChannelsConfig::default();
+        c.feishu_accounts.insert(
+            "ops".into(),
+            FeishuConfig {
+                app_id: "cli_ops".into(),
+                app_secret: "ops-secret".into(),
+                enabled: Some(false),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+        c.feishu_accounts.insert(
+            "sales".into(),
+            FeishuConfig {
+                app_id: "cli_sales".into(),
+                app_secret: "sales-secret".into(),
+                enabled: Some(true),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".into()],
+                receive_mode: LarkReceiveMode::Websocket,
+                port: None,
+            },
+        );
+
+        let enabled = c.enabled_feishu_accounts();
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].account_id, "sales");
     }
 
     #[test]

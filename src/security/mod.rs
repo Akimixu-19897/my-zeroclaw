@@ -27,6 +27,8 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
+pub mod feishu_owner_policy;
+pub mod feishu_scopes;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
@@ -46,6 +48,15 @@ pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+#[allow(unused_imports)]
+pub use feishu_owner_policy::{
+    evaluate_feishu_owner_policy, FeishuOwnerPolicyDisposition, FeishuOwnerPolicyReport,
+};
+#[allow(unused_imports)]
+pub use feishu_scopes::{
+    all_feishu_tool_scope_requirements, feishu_tool_scope_requirements, missing_scopes_for_tool,
+    FeishuToolScopeRequirements,
+};
 #[allow(unused_imports)]
 pub use otp::OtpValidator;
 #[allow(unused_imports)]

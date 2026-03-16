@@ -30,6 +30,7 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+const CHANNEL_APPROVAL_REQUEST_FENCE: &str = "zeroclaw-approval";
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -323,6 +324,34 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     }
+}
+
+fn tool_requires_explicit_approval(reason: &str) -> bool {
+    reason
+        .to_ascii_lowercase()
+        .contains("requires explicit approval")
+}
+
+fn tool_call_is_explicitly_approved(args: &serde_json::Value) -> bool {
+    args.get("approved")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn build_channel_approval_request(
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    reason: &str,
+) -> String {
+    let preview = serde_json::to_string_pretty(tool_args).unwrap_or_else(|_| tool_args.to_string());
+    let payload = serde_json::json!({
+        "type": "tool_approval_request",
+        "tool_name": tool_name,
+        "arguments": tool_args,
+        "reason": reason,
+        "preview": preview,
+    });
+    format!("```{CHANNEL_APPROVAL_REQUEST_FENCE}\n{payload}\n```")
 }
 
 fn parse_tool_call_id(
@@ -2695,6 +2724,25 @@ pub(crate) async fn run_tool_call_loop(
                 let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
             }
 
+            if channel_name != "cli"
+                && !outcome.success
+                && !tool_call_is_explicitly_approved(&call.arguments)
+                && outcome
+                    .error_reason
+                    .as_deref()
+                    .is_some_and(tool_requires_explicit_approval)
+            {
+                let reason = outcome
+                    .error_reason
+                    .as_deref()
+                    .unwrap_or("Approval required");
+                return Ok(build_channel_approval_request(
+                    &call.name,
+                    &call.arguments,
+                    reason,
+                ));
+            }
+
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
@@ -3744,6 +3792,52 @@ mod tests {
         }
     }
 
+    struct ApprovalRequiredTool;
+
+    #[async_trait]
+    impl Tool for ApprovalRequiredTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Approval-required test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if args.get("approved").and_then(serde_json::Value::as_bool) == Some(true) {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "approved".to_string(),
+                    error: None,
+                })
+            } else {
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Command requires explicit approval (approved=true): medium-risk operation"
+                            .to_string(),
+                    ),
+                })
+            }
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3926,6 +4020,47 @@ mod tests {
             &calls,
             Some(&approval_mgr)
         ));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_channel_approval_request_for_explicit_approval_errors() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"touch /tmp/approval-test"}}
+</tool_call>"#,
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ApprovalRequiredTool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run approval-gated command"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("channel approval request should be returned");
+
+        assert!(result.contains("```zeroclaw-approval"));
+        assert!(result.contains("\"tool_name\":\"shell\""));
+        assert!(result.contains("requires explicit approval"));
     }
 
     #[tokio::test]

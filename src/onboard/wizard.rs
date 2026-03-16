@@ -232,7 +232,9 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     let mut config = Config::load_or_init().await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels()?;
+    config.channels_config = setup_channels_with_existing(migrate_legacy_feishu_channels_config(
+        config.channels_config.clone(),
+    ))?;
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -3370,12 +3372,39 @@ fn channel_menu_choices() -> &'static [ChannelMenuChoice] {
 }
 
 #[allow(clippy::too_many_lines)]
+fn migrate_legacy_feishu_channels_config(mut config: ChannelsConfig) -> ChannelsConfig {
+    let Some(lark) = config.lark.as_ref() else {
+        return config;
+    };
+
+    if !lark.use_feishu || config.feishu.is_some() {
+        return config;
+    }
+
+    config.feishu = Some(crate::config::schema::FeishuConfig {
+        app_id: lark.app_id.clone(),
+        app_secret: lark.app_secret.clone(),
+        enabled: None,
+        encrypt_key: lark.encrypt_key.clone(),
+        verification_token: lark.verification_token.clone(),
+        allowed_users: lark.allowed_users.clone(),
+        receive_mode: lark.receive_mode.clone(),
+        port: lark.port,
+    });
+    config.lark = None;
+    config
+}
+
 fn setup_channels() -> Result<ChannelsConfig> {
+    setup_channels_with_existing(ChannelsConfig::default())
+}
+
+fn setup_channels_with_existing(config: ChannelsConfig) -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
-    let mut config = ChannelsConfig::default();
+    let mut config = config;
     let menu_choices = channel_menu_choices();
 
     loop {
@@ -4937,17 +4966,30 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
-                config.lark = Some(LarkConfig {
-                    app_id,
-                    app_secret,
-                    verification_token,
-                    encrypt_key: None,
-                    allowed_users,
-                    mention_only: false,
-                    use_feishu: is_feishu,
-                    receive_mode,
-                    port,
-                });
+                if is_feishu {
+                    config.feishu = Some(crate::config::schema::FeishuConfig {
+                        app_id,
+                        app_secret,
+                        enabled: None,
+                        encrypt_key: None,
+                        verification_token,
+                        allowed_users,
+                        receive_mode,
+                        port,
+                    });
+                } else {
+                    config.lark = Some(LarkConfig {
+                        app_id,
+                        app_secret,
+                        verification_token,
+                        encrypt_key: None,
+                        allowed_users,
+                        mention_only: false,
+                        use_feishu: false,
+                        receive_mode,
+                        port,
+                    });
+                }
             }
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
@@ -7196,6 +7238,7 @@ mod tests {
         channels.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_123".into(),
             app_secret: "secret".into(),
+            enabled: None,
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
@@ -7203,5 +7246,71 @@ mod tests {
             port: None,
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn migrate_legacy_feishu_channels_config_moves_lark_compat_to_native_feishu() {
+        let mut channels = ChannelsConfig::default();
+        channels.lark = Some(LarkConfig {
+            app_id: "cli_feishu_legacy".into(),
+            app_secret: "legacy-secret".into(),
+            verification_token: Some("verify".into()),
+            encrypt_key: Some("encrypt".into()),
+            allowed_users: vec!["ou_legacy".into()],
+            mention_only: false,
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(8080),
+        });
+
+        let migrated = migrate_legacy_feishu_channels_config(channels);
+
+        assert!(migrated.lark.is_none());
+        let feishu = migrated
+            .feishu
+            .expect("native feishu config should be created");
+        assert_eq!(feishu.app_id, "cli_feishu_legacy");
+        assert_eq!(feishu.app_secret, "legacy-secret");
+        assert_eq!(feishu.verification_token.as_deref(), Some("verify"));
+        assert_eq!(feishu.encrypt_key.as_deref(), Some("encrypt"));
+        assert_eq!(feishu.allowed_users, vec!["ou_legacy"]);
+        assert_eq!(feishu.receive_mode, LarkReceiveMode::Webhook);
+        assert_eq!(feishu.port, Some(8080));
+    }
+
+    #[test]
+    fn migrate_legacy_feishu_channels_config_keeps_existing_native_feishu() {
+        let mut channels = ChannelsConfig::default();
+        channels.lark = Some(LarkConfig {
+            app_id: "cli_feishu_legacy".into(),
+            app_secret: "legacy-secret".into(),
+            verification_token: Some("legacy-verify".into()),
+            encrypt_key: Some("legacy-encrypt".into()),
+            allowed_users: vec!["ou_legacy".into()],
+            mention_only: false,
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(8080),
+        });
+        channels.feishu = Some(crate::config::schema::FeishuConfig {
+            app_id: "cli_native".into(),
+            app_secret: "native-secret".into(),
+            enabled: None,
+            encrypt_key: Some("native-encrypt".into()),
+            verification_token: Some("native-verify".into()),
+            allowed_users: vec!["ou_native".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+
+        let migrated = migrate_legacy_feishu_channels_config(channels);
+
+        assert!(migrated.lark.is_some());
+        let feishu = migrated
+            .feishu
+            .expect("existing native feishu config should remain");
+        assert_eq!(feishu.app_id, "cli_native");
+        assert_eq!(feishu.allowed_users, vec!["ou_native"]);
+        assert_eq!(feishu.receive_mode, LarkReceiveMode::Websocket);
     }
 }

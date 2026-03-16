@@ -1,3 +1,5 @@
+pub(crate) mod feishu;
+
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -8,6 +10,8 @@ const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const LEGACY_FEISHU_PLUGIN_ID: &str = "feishu-openclaw-plugin";
+const OFFICIAL_LARK_PLUGIN_ID: &str = "openclaw-lark";
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -598,6 +602,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
+    check_feishu_plugin_conflicts(config, items);
+
     // Delegate agents: provider validity
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
@@ -613,6 +619,69 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+}
+
+fn check_feishu_plugin_conflicts(config: &Config, items: &mut Vec<DiagItem>) {
+    check_feishu_plugin_conflicts_in_dir(config, &openclaw_extensions_dir(), items);
+}
+
+fn check_feishu_plugin_conflicts_in_dir(
+    config: &Config,
+    extensions_dir: &Path,
+    items: &mut Vec<DiagItem>,
+) {
+    let cat = "config";
+    let native_feishu_configured = config.channels_config.feishu.is_some()
+        || !config.channels_config.feishu_accounts.is_empty()
+        || config
+            .channels_config
+            .lark
+            .as_ref()
+            .is_some_and(|cfg| cfg.use_feishu);
+    let mut detected_plugins = Vec::new();
+
+    for plugin_id in [LEGACY_FEISHU_PLUGIN_ID, OFFICIAL_LARK_PLUGIN_ID] {
+        if extensions_dir.join(plugin_id).exists() {
+            detected_plugins.push(plugin_id);
+        }
+    }
+
+    if detected_plugins.is_empty() {
+        return;
+    }
+
+    let detected_summary = detected_plugins.join(", ");
+    if native_feishu_configured {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "detected external Feishu/Lark plugin directory under {} ({detected_summary}) while native Feishu config is also enabled; remove the Node plugin or migrate fully to avoid double-handling and confusing diagnostics",
+                extensions_dir.display()
+            ),
+        ));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "detected external Feishu/Lark plugin directory under {} ({detected_summary}); this workspace appears to rely on the Node plugin lifecycle rather than ZeroClaw's native Feishu channel",
+                extensions_dir.display()
+            ),
+        ));
+    }
+}
+
+fn openclaw_extensions_dir() -> std::path::PathBuf {
+    let state_dir = std::env::var_os("OPENCLAW_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                let mut path = std::path::PathBuf::from(home);
+                path.push(".openclaw");
+                path
+            })
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".openclaw"));
+    state_dir.join("extensions")
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -877,14 +946,20 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 .map_or(i64::MAX, |dt| {
                     Utc::now().signed_duration_since(dt).num_seconds()
                 });
+            let detail_suffix = summarize_channel_component_details(component)
+                .map(|summary| format!(" [{summary}]"))
+                .unwrap_or_default();
 
             if status_ok && age <= CHANNEL_STALE_SECONDS {
-                items.push(DiagItem::ok(cat, format!("{name} fresh ({age}s ago)")));
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("{name} fresh ({age}s ago){detail_suffix}"),
+                ));
             } else {
                 stale += 1;
                 items.push(DiagItem::error(
                     cat,
-                    format!("{name} stale (ok={status_ok}, age={age}s)"),
+                    format!("{name} stale (ok={status_ok}, age={age}s){detail_suffix}"),
                 ));
             }
         }
@@ -898,6 +973,42 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+}
+
+fn summarize_channel_component_details(component: &serde_json::Value) -> Option<String> {
+    let details = component.get("details")?;
+    let probe_kind = details
+        .get("probe_kind")
+        .and_then(serde_json::Value::as_str)?;
+
+    if probe_kind != "lark_channel" {
+        return None;
+    }
+
+    let token = details
+        .get("token_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let transport = details
+        .get("transport_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let bot = details
+        .get("bot_identity_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let owner_policy = details
+        .get("owner_policy_disposition")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let account = details
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+
+    Some(format!(
+        "lark account={account}, token={token}, transport={transport}, bot={bot}, owner_policy={owner_policy}"
+    ))
 }
 
 // ── Environment checks ───────────────────────────────────────────
@@ -1245,6 +1356,73 @@ mod tests {
         let stdout =
             "Filesystem 1M-blocks Used Available Use% Mounted on\n/dev/sda1 1000 500 500 50% /\n";
         assert_eq!(parse_df_available_mb(stdout), Some(500));
+    }
+
+    #[test]
+    fn summarize_channel_component_details_formats_lark_probe() {
+        let summary = summarize_channel_component_details(&serde_json::json!({
+            "details": {
+                "probe_kind": "lark_channel",
+                "account_id": "primary",
+                "token_status": "ok",
+                "transport_status": "error",
+                "bot_identity_status": "ok"
+            }
+        }))
+        .expect("lark probe summary should render");
+
+        assert!(summary.contains("account=primary"));
+        assert!(summary.contains("token=ok"));
+        assert!(summary.contains("transport=error"));
+        assert!(summary.contains("bot=ok"));
+    }
+
+    #[test]
+    fn config_validation_warns_when_native_feishu_and_external_plugin_coexist() {
+        let tmp = TempDir::new().unwrap();
+        let extensions_dir = tmp.path().join("extensions").join(OFFICIAL_LARK_PLUGIN_ID);
+        std::fs::create_dir_all(&extensions_dir).unwrap();
+
+        let mut config = Config::default();
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "cli_a".into(),
+            app_secret: "secret".into(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: Vec::new(),
+            port: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+        });
+
+        let mut items = Vec::new();
+        check_feishu_plugin_conflicts_in_dir(&config, &tmp.path().join("extensions"), &mut items);
+
+        let item = items.iter().find(|item| {
+            item.message
+                .contains("external Feishu/Lark plugin directory")
+                && item.message.contains(OFFICIAL_LARK_PLUGIN_ID)
+        });
+        assert!(item.is_some());
+        assert_eq!(item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_when_only_external_feishu_plugin_is_detected() {
+        let tmp = TempDir::new().unwrap();
+        let extensions_dir = tmp.path().join("extensions").join(LEGACY_FEISHU_PLUGIN_ID);
+        std::fs::create_dir_all(&extensions_dir).unwrap();
+
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_feishu_plugin_conflicts_in_dir(&config, &tmp.path().join("extensions"), &mut items);
+
+        let item = items.iter().find(|item| {
+            item.message.contains("rely on the Node plugin lifecycle")
+                && item.message.contains(LEGACY_FEISHU_PLUGIN_ID)
+        });
+        assert!(item.is_some());
+        assert_eq!(item.unwrap().severity, Severity::Warn);
     }
 
     #[test]
