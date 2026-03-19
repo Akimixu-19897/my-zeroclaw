@@ -112,13 +112,35 @@ pub(crate) fn conversation_thread_scope(msg: &traits::ChannelMessage) -> Option<
 }
 
 pub(crate) fn should_forward_tool_events_as_thread_messages(channel_name: &str) -> bool {
-    !(channel_name == "cli" || channel_name == "wecom" || channel_name.starts_with("wecom:"))
+    !(channel_name == "cli"
+        || channel_name == "wecom"
+        || channel_name.starts_with("wecom:")
+        || channel_uses_flat_replies(channel_name))
+}
+
+pub(crate) fn channel_uses_flat_replies(channel_name: &str) -> bool {
+    channel_name == "feishu"
+        || channel_name.starts_with("feishu:")
+        || channel_name == "lark"
+        || channel_name.starts_with("lark:")
+}
+
+pub(crate) fn outbound_thread_ts(channel_name: &str, thread_ts: Option<String>) -> Option<String> {
+    if channel_uses_flat_replies(channel_name) {
+        None
+    } else {
+        thread_ts
+    }
 }
 
 pub(crate) fn final_reply_thread_ts_after_tool_updates(
     msg: &traits::ChannelMessage,
     tools_used: bool,
 ) -> Option<String> {
+    if channel_uses_flat_replies(&msg.channel) {
+        return None;
+    }
+
     if tools_used && should_forward_tool_events_as_thread_messages(&msg.channel) {
         Some(msg.id.clone())
     } else {

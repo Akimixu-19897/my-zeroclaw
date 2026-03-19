@@ -1138,6 +1138,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let err = deliver_announcement(&config, "feishu", None, "oc_test_target", "hello")
@@ -1166,6 +1168,8 @@ mod tests {
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -1194,6 +1198,8 @@ mod tests {
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -1229,6 +1235,8 @@ mod tests {
                     allowed_users: vec!["*".into()],
                     receive_mode: LarkReceiveMode::Websocket,
                     port: None,
+                    media_max_mb: None,
+                    media_local_roots: Vec::new(),
                 },
             );
         }

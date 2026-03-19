@@ -1,10 +1,11 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage};
 pub(crate) mod attachments;
 pub(crate) mod cards;
 pub(crate) mod delivery;
 pub(crate) mod helpers;
 pub(crate) mod inbound;
 pub(crate) mod media;
+pub(crate) mod media_source;
 pub(crate) mod message_builders;
 pub(crate) mod outbound;
 pub(crate) mod protocol;
@@ -31,7 +32,7 @@ use self::inbound::{
 };
 use self::media::{
     content_type_from_response, extract_response_file_name, materialize_outbound_attachment,
-    store_inbound_resource, store_inbound_resource_with_limit, LarkDownloadedResource,
+    store_inbound_resource_with_limit, LarkDownloadedResource,
     LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES,
 };
 use self::message_builders::{
@@ -191,6 +192,8 @@ pub struct LarkChannel {
     api_base_override: Option<String>,
     ws_base_override: Option<String>,
     workspace_dir: Option<PathBuf>,
+    media_max_bytes: Option<usize>,
+    media_local_roots: Option<Vec<PathBuf>>,
 }
 
 impl LarkChannel {
@@ -287,6 +290,8 @@ impl LarkChannel {
             api_base_override: None,
             ws_base_override: None,
             workspace_dir: None,
+            media_max_bytes: None,
+            media_local_roots: None,
         }
     }
 
@@ -308,6 +313,12 @@ impl LarkChannel {
             platform,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.media_max_bytes = config
+            .media_max_mb
+            .filter(|value| *value > 0)
+            .map(|value| value.saturating_mul(1024 * 1024));
+        ch.media_local_roots = (!config.media_local_roots.is_empty())
+            .then_some(config.media_local_roots.clone());
         ch
     }
 
@@ -322,6 +333,12 @@ impl LarkChannel {
             LarkPlatform::Lark,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.media_max_bytes = config
+            .media_max_mb
+            .filter(|value| *value > 0)
+            .map(|value| value.saturating_mul(1024 * 1024));
+        ch.media_local_roots = (!config.media_local_roots.is_empty())
+            .then_some(config.media_local_roots.clone());
         ch
     }
 
@@ -336,6 +353,12 @@ impl LarkChannel {
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.media_max_bytes = config
+            .media_max_mb
+            .filter(|value| *value > 0)
+            .map(|value| value.saturating_mul(1024 * 1024));
+        ch.media_local_roots = (!config.media_local_roots.is_empty())
+            .then_some(config.media_local_roots.clone());
         ch
     }
 
@@ -400,8 +423,11 @@ impl LarkChannel {
         format!("{}/bot/v3/info", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, receive_id_type: &str) -> String {
+        format!(
+            "{}/im/v1/messages?receive_id_type={receive_id_type}",
+            self.api_base()
+        )
     }
 
     fn reply_message_url(&self, message_id: &str) -> String {

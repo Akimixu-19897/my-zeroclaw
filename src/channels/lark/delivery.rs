@@ -1,6 +1,9 @@
 use super::*;
+use crate::channels::lark::helpers::parse_post_content;
+use crate::channels::lark::message_builders::build_lark_post_content;
+use crate::channels::lark::outbound::{normalize_lark_target, resolve_lark_receive_id_type};
 use crate::channels::strip_tool_call_tags;
-use crate::channels::traits::ChannelMessageContext;
+use crate::channels::traits::{ChannelMessageContext, SendMessage};
 use async_trait::async_trait;
 
 impl LarkChannel {
@@ -245,6 +248,44 @@ impl LarkChannel {
         ))
     }
 
+    async fn fetch_parent_message_content(
+        &self,
+        parent_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let response = self.fetch_message_items(parent_id).await?;
+        if extract_lark_response_code(&response).unwrap_or(-1) != 0 {
+            return Ok(None);
+        }
+
+        let Some(item) = response.pointer("/data/items/0") else {
+            return Ok(None);
+        };
+
+        let msg_type = item
+            .get("msg_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("text");
+
+        if msg_type == "merge_forward" {
+            let content = self.fetch_merge_forward_content(parent_id).await?;
+            return Ok((!content.trim().is_empty()).then_some(content));
+        }
+
+        let raw_content = item
+            .pointer("/body/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("{}");
+        let resources = parse_lark_inbound_resources(msg_type, raw_content);
+        let text = match msg_type {
+            "text" => parse_lark_text_content(raw_content),
+            "post" => parse_post_content(raw_content),
+            _ => None,
+        };
+        let content =
+            build_lark_normalized_content(msg_type, raw_content, text.as_deref(), &resources);
+        Ok((!content.trim().is_empty()).then_some(content))
+    }
+
     fn parse_inbound_message_from_content(
         &self,
         sender_open_id: &str,
@@ -429,11 +470,16 @@ impl LarkChannel {
         &self,
         body: &serde_json::Value,
         reply_to_message_id: Option<&str>,
+        recipient: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let token = self.get_tenant_access_token().await?;
         let url = reply_to_message_id
             .map(|message_id| self.reply_message_url(message_id))
-            .unwrap_or_else(|| self.send_message_url());
+            .unwrap_or_else(|| {
+                let receive_id_type =
+                    resolve_lark_receive_id_type(recipient.unwrap_or_default().trim());
+                self.send_message_url(receive_id_type)
+            });
         let (status, response) = self.send_json_once(&url, &token, body).await?;
 
         if should_refresh_lark_tenant_token(status, &response) {
@@ -682,9 +728,10 @@ impl LarkChannel {
         &self,
         body: &serde_json::Value,
         reply_to_message_id: Option<&str>,
+        recipient: Option<&str>,
     ) -> anyhow::Result<()> {
         let _ = self
-            .send_json_message_with_response(body, reply_to_message_id)
+            .send_json_message_with_response(body, reply_to_message_id, recipient)
             .await?;
         Ok(())
     }
@@ -696,11 +743,12 @@ impl LarkChannel {
         reply_to_message_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let body = if reply_to_message_id.is_some() {
-            build_lark_reply_message_body("text", serde_json::json!({ "text": content }), true)
+            build_lark_reply_message_body("post", build_lark_post_content(content), true)
         } else {
             build_lark_text_message_body(recipient, content)
         };
-        self.send_json_message(&body, reply_to_message_id).await
+        self.send_json_message(&body, reply_to_message_id, Some(recipient))
+            .await
     }
 
     async fn note_message_unavailable(&self, message_id: &str, body: &serde_json::Value) {
@@ -946,16 +994,29 @@ impl LarkChannel {
         parsed: LarkParsedMessage,
     ) -> Option<ChannelMessage> {
         let downloaded = self.materialize_inbound_resources(&parsed).await;
-        let content = if parsed.resources.is_empty() {
+        let mut content = if parsed.resources.is_empty() {
             parsed.normalized_content.clone()
         } else {
             self.build_inbound_content(&parsed, &downloaded)
         };
+
+        if let Some(parent_id) = parsed.parent_id.as_deref() {
+            match self.fetch_parent_message_content(parent_id).await {
+                Ok(Some(quoted)) => {
+                    content = format!("[quoted message {parent_id}]\n{quoted}\n\n{content}");
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!("Lark: failed to fetch quoted parent {}: {err}", parent_id);
+                }
+            }
+        }
+
         if content.trim().is_empty() {
             return None;
         }
 
-        let thread_ts = parsed.thread_id.clone().or(parsed.root_id.clone());
+        let thread_ts = parsed.thread_id.clone();
         let context = Some(Self::build_channel_message_context(&parsed));
         Some(ChannelMessage {
             id: parsed.message_id.clone(),
@@ -1053,7 +1114,7 @@ impl LarkChannel {
             return Vec::new();
         }
 
-        let thread_ts = parsed.thread_id.clone().or(parsed.root_id.clone());
+        let thread_ts = parsed.thread_id.clone();
         let context = Some(Self::build_channel_message_context(&parsed));
         vec![ChannelMessage {
             id: parsed.message_id.clone(),
@@ -1143,9 +1204,13 @@ impl LarkChannel {
         kind: LarkAttachmentKind,
         reply_to_message_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        let path = super::media_source::validate_explicit_local_media_path(
+            path.to_path_buf(),
+            self.workspace_dir.as_deref(),
+        )?;
         let body = match kind {
             LarkAttachmentKind::Image => {
-                let image_key = self.upload_image_with_retry(path).await?;
+                let image_key = self.upload_image_with_retry(&path).await?;
                 if reply_to_message_id.is_some() {
                     build_lark_reply_message_body(
                         "image",
@@ -1159,8 +1224,8 @@ impl LarkChannel {
             LarkAttachmentKind::Document
             | LarkAttachmentKind::Audio
             | LarkAttachmentKind::Video => {
-                let file_type = Self::detect_upload_file_type(path, kind);
-                let file_key = self.upload_file_with_retry(path, file_type).await?;
+                let file_type = Self::detect_upload_file_type(&path, kind);
+                let file_key = self.upload_file_with_retry(&path, file_type).await?;
                 match (kind, reply_to_message_id) {
                     (LarkAttachmentKind::Document, Some(_)) => build_lark_reply_message_body(
                         "file",
@@ -1191,7 +1256,8 @@ impl LarkChannel {
             }
         };
 
-        self.send_json_message(&body, reply_to_message_id).await
+        self.send_json_message(&body, reply_to_message_id, Some(recipient))
+            .await
     }
 
     async fn draft_session(&self, message_id: &str) -> Option<LarkDraftSession> {
@@ -1362,7 +1428,9 @@ impl Channel for LarkChannel {
             } else {
                 build_lark_card_message_body(&outbound.target, card)
             };
-            return self.send_json_message(&body, reply_to_message_id).await;
+            return self
+                .send_json_message(&body, reply_to_message_id, Some(&outbound.target))
+                .await;
         }
 
         if !outbound.text.is_empty() && !path_only_text {
@@ -1370,21 +1438,12 @@ impl Channel for LarkChannel {
                 .await?;
         }
 
-        for image_path in &outbound.local_images {
+        for attachment in &outbound.local_attachments {
+            let path = Path::new(&attachment.target);
             self.send_attachment_path(
                 &outbound.target,
-                image_path,
-                LarkAttachmentKind::Image,
-                reply_to_message_id,
-            )
-            .await?;
-        }
-
-        for document_path in &outbound.local_documents {
-            self.send_attachment_path(
-                &outbound.target,
-                document_path,
-                LarkAttachmentKind::Document,
+                path,
+                attachment.kind,
                 reply_to_message_id,
             )
             .await?;
@@ -1394,6 +1453,9 @@ impl Channel for LarkChannel {
             let path = materialize_outbound_attachment(
                 &self.http_client(),
                 self.workspace_dir.as_deref(),
+                self.media_max_bytes
+                    .unwrap_or(LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES),
+                self.media_local_roots.clone(),
                 self.channel_name(),
                 self.account_id(),
                 Self::outbound_resource_kind(*kind),
@@ -1429,14 +1491,16 @@ impl Channel for LarkChannel {
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let recipient =
+            normalize_lark_target(&message.recipient).unwrap_or_else(|| message.recipient.clone());
         let card = build_lark_streaming_card(LarkCardPhase::Thinking, &message.content);
         let body = if message.thread_ts.is_some() {
             build_lark_reply_card_message_body(&card, true)
         } else {
-            build_lark_card_message_body(&message.recipient, &card)
+            build_lark_card_message_body(&recipient, &card)
         };
         let response = self
-            .send_json_message_with_response(&body, message.thread_ts.as_deref())
+            .send_json_message_with_response(&body, message.thread_ts.as_deref(), Some(&recipient))
             .await?;
         let message_id = response
             .pointer("/data/message_id")
@@ -1444,12 +1508,8 @@ impl Channel for LarkChannel {
             .map(str::to_string);
 
         if let Some(message_id) = message_id.as_deref() {
-            self.register_draft_session(
-                &message.recipient,
-                message_id,
-                message.thread_ts.as_deref(),
-            )
-            .await;
+            self.register_draft_session(&recipient, message_id, message.thread_ts.as_deref())
+                .await;
         }
 
         Ok(message_id)

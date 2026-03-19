@@ -15,6 +15,8 @@ pub(crate) struct FeishuToolClient {
     app_secret: String,
     api_base: String,
     http_client: reqwest::Client,
+    media_max_bytes: Option<usize>,
+    media_local_roots: Option<Vec<std::path::PathBuf>>,
 }
 
 impl FeishuToolClient {
@@ -22,6 +24,12 @@ impl FeishuToolClient {
         let (account_name, account_config) = resolve_feishu_account(config.as_ref(), account)?;
         Ok(Self {
             account_name,
+            media_max_bytes: account_config
+                .media_max_mb
+                .filter(|value| *value > 0)
+                .map(|value| value.saturating_mul(1024 * 1024)),
+            media_local_roots: (!account_config.media_local_roots.is_empty())
+                .then_some(account_config.media_local_roots.clone()),
             app_id: account_config.app_id,
             app_secret: account_config.app_secret,
             api_base: FEISHU_OPEN_API_BASE.to_string(),
@@ -45,6 +53,14 @@ impl FeishuToolClient {
 
     pub(crate) fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    pub(crate) fn media_max_bytes(&self) -> Option<usize> {
+        self.media_max_bytes
+    }
+
+    pub(crate) fn media_local_roots(&self) -> Option<&[std::path::PathBuf]> {
+        self.media_local_roots.as_deref()
     }
 
     pub(crate) async fn tenant_access_token(&self) -> anyhow::Result<String> {
@@ -225,6 +241,27 @@ impl FeishuToolClient {
 
         self.post_multipart(path, form).await
     }
+
+    pub(crate) async fn upload_named_bytes(
+        &self,
+        path: &str,
+        part_name: &str,
+        file_name: &str,
+        mime_type: &str,
+        file_bytes: Vec<u8>,
+        text_fields: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let file_part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(mime_type)?;
+
+        let mut form = reqwest::multipart::Form::new().part(part_name.to_string(), file_part);
+        for (key, value) in text_fields {
+            form = form.text((*key).to_string(), (*value).to_string());
+        }
+
+        self.post_multipart(path, form).await
+    }
 }
 
 fn resolve_feishu_account(
@@ -311,13 +348,15 @@ mod tests {
                 feishu: Some(FeishuConfig {
                     app_id: "cli_test_app".to_string(),
                     app_secret: "secret".to_string(),
-                    enabled: None,
-                    encrypt_key: None,
-                    verification_token: None,
-                    allowed_users: vec!["*".to_string()],
-                    receive_mode: LarkReceiveMode::default(),
-                    port: None,
-                }),
+                enabled: None,
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["*".to_string()],
+                receive_mode: LarkReceiveMode::default(),
+                port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
+            }),
                 ..ChannelsConfig::default()
             },
             ..Config::default()
@@ -344,6 +383,8 @@ mod tests {
                 allowed_users: vec!["*".to_string()],
                 receive_mode: LarkReceiveMode::default(),
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -368,6 +409,8 @@ mod tests {
                 allowed_users: vec!["*".to_string()],
                 receive_mode: LarkReceiveMode::default(),
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -390,6 +433,8 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let err = FeishuToolClient::from_config(Arc::new(config), None)
@@ -414,6 +459,8 @@ mod tests {
                 allowed_users: vec!["*".to_string()],
                 receive_mode: LarkReceiveMode::default(),
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -458,5 +505,29 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("docs:document"));
         assert!(rendered.contains("drive:drive"));
+    }
+
+    #[test]
+    fn resolves_media_settings_from_feishu_account_config() {
+        let mut config = base_config();
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_media".to_string(),
+            app_secret: "secret".to_string(),
+            enabled: None,
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".to_string()],
+            receive_mode: LarkReceiveMode::default(),
+            port: None,
+            media_max_mb: Some(8),
+            media_local_roots: vec![std::path::PathBuf::from("/tmp/feishu-media")],
+        });
+
+        let client = FeishuToolClient::from_config(Arc::new(config), None).unwrap();
+        assert_eq!(client.media_max_bytes(), Some(8 * 1024 * 1024));
+        assert_eq!(
+            client.media_local_roots(),
+            Some([std::path::PathBuf::from("/tmp/feishu-media")].as_slice())
+        );
     }
 }

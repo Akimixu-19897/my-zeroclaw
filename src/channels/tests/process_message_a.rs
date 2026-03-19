@@ -66,6 +66,67 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
 }
 
 #[tokio::test]
+async fn process_channel_message_replies_flat_in_feishu_even_when_inbound_has_thread() {
+    let channel_impl = Arc::new(RecordingFeishuChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(DummyProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        multimodal: crate::config::MultimodalConfig::default(),
+        hooks: None,
+        model_routes: Arc::new(Vec::new()),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            id: "om_root_1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "oc_chat_1".to_string(),
+            content: "hello".to_string(),
+            channel: "feishu".to_string(),
+            timestamp: 1,
+            thread_ts: Some("om_root_1".to_string()),
+            context: None,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent.as_slice(), ["oc_chat_1:ok"]);
+    drop(sent);
+
+    let sent_threads = channel_impl.sent_threads.lock().await;
+    assert_eq!(sent_threads.as_slice(), &[None]);
+}
+
+#[tokio::test]
 async fn process_channel_message_sends_feishu_confirmation_card_for_pending_approval() {
     let _guard = approval_test_lock().lock().await;
     clear_pending_channel_approvals();
@@ -125,6 +186,10 @@ async fn process_channel_message_sends_feishu_confirmation_card_for_pending_appr
     assert!(sent[0].contains("```lark-card"));
     assert!(sent[0].contains("Confirmation Required"));
     assert!(sent[0].contains("confirm_write"));
+    drop(sent);
+
+    let sent_threads = channel_impl.sent_threads.lock().await;
+    assert_eq!(sent_threads.as_slice(), &[None]);
 }
 
 #[tokio::test]
@@ -209,6 +274,10 @@ async fn process_channel_message_confirm_action_executes_pending_approval() {
         "unexpected approval completion payload: {}",
         sent[0]
     );
+    drop(sent);
+
+    let sent_threads = channel_impl.sent_threads.lock().await;
+    assert_eq!(sent_threads.as_slice(), &[None]);
     assert!(get_pending_channel_approval(&operation_id).is_none());
 }
 

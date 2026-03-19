@@ -1986,6 +1986,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -1997,14 +1998,7 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = {
-        let raw = call_arguments.to_string();
-        if raw.len() > 300 {
-            format!("{}…", &raw[..300])
-        } else {
-            raw
-        }
-    };
+    let args_summary = summarize_tool_arguments(&call_arguments);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         arguments: Some(args_summary),
@@ -2078,6 +2072,11 @@ async fn execute_one_tool(
             })
         }
     }
+}
+
+fn summarize_tool_arguments(call_arguments: &serde_json::Value) -> String {
+    let raw = call_arguments.to_string();
+    truncate_with_ellipsis(&raw, 300)
 }
 
 struct ToolExecutionOutcome {
@@ -2185,6 +2184,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    channel_tool_context: Option<serde_json::Value>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2593,6 +2593,8 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            let tool_args = inject_channel_tool_context(tool_args, channel_tool_context.as_ref());
+
             let signature = tool_call_signature(&tool_name, &tool_args);
             if !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
@@ -2805,6 +2807,24 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
+fn inject_channel_tool_context(
+    args: serde_json::Value,
+    channel_tool_context: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(context) = channel_tool_context else {
+        return args;
+    };
+
+    let serde_json::Value::Object(mut object) = args else {
+        return args;
+    };
+
+    object
+        .entry("__channel_context".to_string())
+        .or_insert_with(|| context.clone());
+    serde_json::Value::Object(object)
+}
+
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
@@ -2820,6 +2840,16 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str(
+        "If a delivery/send tool result says the content is already delivered to the current chat \
+         and includes `assistant_reply=NO_REPLY`, end the turn with exactly `NO_REPLY`. Do not call \
+         another send tool for the same request unless the previous send failed.\n\n",
+    );
+    instructions.push_str(
+        "If the user already provided an exact absolute file path or exact URL for a channel attachment, \
+         prefer the channel's direct delivery path first. Do not call search/list/glob/shell tools just to \
+         rediscover the same path.\n\n",
+    );
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -3156,6 +3186,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3278,6 +3309,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3868,6 +3900,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3914,6 +3947,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3954,6 +3988,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4054,6 +4089,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("channel approval request should be returned");
@@ -4121,6 +4157,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4190,6 +4227,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4246,6 +4284,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -4842,6 +4881,8 @@ Tail"#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+        assert!(instructions.contains("exact absolute file path"));
+        assert!(instructions.contains("Do not call search/list/glob/shell tools"));
     }
 
     #[test]
@@ -5123,6 +5164,59 @@ Final answer."#;
     fn strip_tool_result_blocks_returns_empty_for_only_tags() {
         let input = "<tool_result name=\"memory_recall\" status=\"ok\">\n{}\n</tool_result>";
         assert_eq!(strip_tool_result_blocks(input), "");
+    }
+
+    #[test]
+    fn inject_channel_tool_context_adds_reserved_context_once() {
+        let args = serde_json::json!({ "text": "hello" });
+        let context = serde_json::json!({
+            "current_channel_name": "feishu:primary",
+            "current_channel_id": "chat:oc_chat_1",
+            "current_message_id": "om_1",
+            "current_thread_ts": "omt_1",
+        });
+
+        let injected = inject_channel_tool_context(args, Some(&context));
+
+        assert_eq!(injected["text"], "hello");
+        assert_eq!(injected["__channel_context"], context);
+    }
+
+    #[test]
+    fn inject_channel_tool_context_preserves_existing_reserved_context() {
+        let existing = serde_json::json!({
+            "current_channel_name": "feishu:primary",
+            "current_channel_id": "chat:oc_existing",
+        });
+        let args = serde_json::json!({
+            "text": "hello",
+            "__channel_context": existing.clone(),
+        });
+        let replacement = serde_json::json!({
+            "current_channel_name": "feishu:secondary",
+            "current_channel_id": "chat:oc_other",
+        });
+
+        let injected = inject_channel_tool_context(args, Some(&replacement));
+
+        assert_eq!(injected["__channel_context"], existing);
+    }
+
+    #[test]
+    fn summarize_tool_arguments_truncates_multibyte_json_without_panicking() {
+        let args = serde_json::json!({
+            "message": "发送一条消息到当前飞书会话".repeat(40),
+            "__channel_context": {
+                "current_channel_id": "user:ou_test",
+                "current_message_id": "om_test",
+            }
+        });
+
+        let summary = summarize_tool_arguments(&args);
+
+        assert!(summary.ends_with("..."));
+        assert!(summary.chars().count() < args.to_string().chars().count());
+        assert!(summary.contains("发送一条消息到当前飞书会话"));
     }
 
     #[test]

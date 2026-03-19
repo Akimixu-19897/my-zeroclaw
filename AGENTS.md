@@ -8,6 +8,16 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+本地构建规则：
+
+```bash
+./cargo-build-clean.sh
+```
+
+- 在本仓库里执行本地 `cargo build` 时，默认必须使用 `./cargo-build-clean.sh`，不要直接运行裸 `cargo build`。
+- 如果需要传递构建参数，也必须透传给脚本，例如 `./cargo-build-clean.sh --release`、`./cargo-build-clean.sh --features rag-pdf`。
+- 该脚本会在构建成功后自动清理 `target/<profile>/incremental` 和 `target/<profile>/deps` 中最占空间的可回收产物，避免仓库体积持续暴涨。
+
 完整的 PR 前验证（推荐）：
 
 ```bash

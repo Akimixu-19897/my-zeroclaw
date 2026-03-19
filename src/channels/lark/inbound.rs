@@ -1609,7 +1609,9 @@ pub(crate) fn parse_lark_inbound_resources(
             parsed.get("file_key").and_then(Value::as_str),
         ),
         "post" => {
-            if let Some(locale) =
+            let locale = if parsed.get("title").is_some() || parsed.get("content").is_some() {
+                Some(&parsed)
+            } else {
                 parsed
                     .get("zh_cn")
                     .or_else(|| parsed.get("en_us"))
@@ -1618,7 +1620,9 @@ pub(crate) fn parse_lark_inbound_resources(
                             .as_object()
                             .and_then(|items| items.values().find(|value| value.is_object()))
                     })
-            {
+            };
+
+            if let Some(locale) = locale {
                 if let Some(paragraphs) = locale.get("content").and_then(Value::as_array) {
                     for paragraph in paragraphs {
                         if let Some(elements) = paragraph.as_array() {

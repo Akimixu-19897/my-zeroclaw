@@ -645,6 +645,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
@@ -670,6 +672,8 @@ mod tests {
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -696,6 +700,8 @@ mod tests {
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 

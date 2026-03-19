@@ -69,11 +69,6 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
-pub use feishu::{
-    FeishuBitableTool, FeishuCalendarTool, FeishuDocCreateTool, FeishuDocFetchTool,
-    FeishuDocUpdateTool, FeishuDriveFileTool, FeishuImMessageTool, FeishuImReadTool,
-    FeishuImResourceTool, FeishuSearchTool, FeishuSheetsTool, FeishuTaskTool, FeishuWikiSpaceTool,
-};
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;

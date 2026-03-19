@@ -3518,6 +3518,12 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Optional outbound media size cap in MB for uploads and remote media fetches.
+    #[serde(default, alias = "mediaMaxMb")]
+    pub media_max_mb: Option<usize>,
+    /// Optional extra trusted local roots for outbound media loading.
+    #[serde(default, alias = "mediaLocalRoots")]
+    pub media_local_roots: Vec<PathBuf>,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -3555,6 +3561,12 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Optional outbound media size cap in MB for uploads and remote media fetches.
+    #[serde(default, alias = "mediaMaxMb")]
+    pub media_max_mb: Option<usize>,
+    /// Optional extra trusted local roots for outbound media loading.
+    #[serde(default, alias = "mediaLocalRoots")]
+    pub media_local_roots: Vec<PathBuf>,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -8220,6 +8232,8 @@ default_model = "legacy-model"
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -8243,6 +8257,8 @@ default_model = "legacy-model"
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -8290,6 +8306,8 @@ default_model = "legacy-model"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -8311,6 +8329,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -8345,6 +8365,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8366,6 +8388,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         c.feishu_accounts.insert(
             "ops".into(),
@@ -8378,6 +8402,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8399,6 +8425,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         c.feishu_accounts.insert(
             "ops".into(),
@@ -8411,6 +8439,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8437,6 +8467,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8474,6 +8506,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         c.feishu_accounts.insert(
             "ops".into(),
@@ -8486,6 +8520,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8516,6 +8552,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         c.feishu_accounts.insert(
             "ops".into(),
@@ -8528,6 +8566,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8550,6 +8590,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         c.feishu_accounts.insert(
             "ops".into(),
@@ -8562,6 +8604,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8588,6 +8632,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -8612,6 +8658,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
         c.feishu_accounts.insert(
@@ -8625,6 +8673,8 @@ default_model = "legacy-model"
                 allowed_users: vec!["*".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 

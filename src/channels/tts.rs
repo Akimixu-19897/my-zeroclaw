@@ -15,6 +15,10 @@ const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 /// Default HTTP request timeout for TTS API calls.
 const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+fn normalize_tts_format(format: &str) -> String {
+    format.trim().to_ascii_lowercase()
+}
+
 // ── TtsProvider trait ────────────────────────────────────────────
 
 /// Trait for pluggable TTS backends.
@@ -23,8 +27,9 @@ pub trait TtsProvider: Send + Sync {
     /// Provider identifier (e.g. `"openai"`, `"elevenlabs"`).
     fn name(&self) -> &str;
 
-    /// Synthesize `text` using the given `voice`, returning raw audio bytes.
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
+    /// Synthesize `text` using the given `voice` and output `format`,
+    /// returning raw audio bytes.
+    async fn synthesize(&self, text: &str, voice: &str, format: &str) -> Result<Vec<u8>>;
 
     /// Voices supported by this provider.
     fn supported_voices(&self) -> Vec<String>;
@@ -79,12 +84,13 @@ impl TtsProvider for OpenAiTtsProvider {
         "openai"
     }
 
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+    async fn synthesize(&self, text: &str, voice: &str, format: &str) -> Result<Vec<u8>> {
         let body = serde_json::json!({
             "model": self.model,
             "input": text,
             "voice": voice,
             "speed": self.speed,
+            "response_format": format,
         });
 
         let resp = self
@@ -180,12 +186,19 @@ impl TtsProvider for ElevenLabsTtsProvider {
         "elevenlabs"
     }
 
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+    async fn synthesize(&self, text: &str, voice: &str, format: &str) -> Result<Vec<u8>> {
         if !voice
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             bail!("ElevenLabs voice ID contains invalid characters: {voice}");
+        }
+        if !self
+            .supported_formats()
+            .iter()
+            .any(|supported| supported == format)
+        {
+            bail!("ElevenLabs TTS does not support output format: {format}");
         }
         let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
         let body = serde_json::json!({
@@ -285,7 +298,13 @@ impl TtsProvider for GoogleTtsProvider {
         "google"
     }
 
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+    async fn synthesize(&self, text: &str, voice: &str, format: &str) -> Result<Vec<u8>> {
+        let audio_encoding = match format {
+            "mp3" => "MP3",
+            "wav" => "LINEAR16",
+            "ogg" | "opus" => "OGG_OPUS",
+            other => bail!("Google TTS does not support output format: {other}"),
+        };
         let url = "https://texttospeech.googleapis.com/v1/text:synthesize";
         let body = serde_json::json!({
             "input": { "text": text },
@@ -294,7 +313,7 @@ impl TtsProvider for GoogleTtsProvider {
                 "name": voice,
             },
             "audioConfig": {
-                "audioEncoding": "MP3",
+                "audioEncoding": audio_encoding,
             },
         });
 
@@ -393,7 +412,10 @@ impl TtsProvider for EdgeTtsProvider {
         "edge"
     }
 
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+    async fn synthesize(&self, text: &str, voice: &str, format: &str) -> Result<Vec<u8>> {
+        if format != "mp3" {
+            bail!("Edge TTS does not support output format: {format}");
+        }
         let temp_dir = std::env::temp_dir();
         let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
         let output_path = output_file
@@ -457,6 +479,7 @@ pub struct TtsManager {
     providers: HashMap<String, Box<dyn TtsProvider>>,
     default_provider: String,
     default_voice: String,
+    default_format: String,
     max_text_length: usize,
 }
 
@@ -519,13 +542,19 @@ impl TtsManager {
             providers,
             default_provider: config.default_provider.clone(),
             default_voice: config.default_voice.clone(),
+            default_format: normalize_tts_format(&config.default_format),
             max_text_length,
         })
     }
 
     /// Synthesize text using the default provider and voice.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        self.synthesize_with_provider(text, &self.default_provider, &self.default_voice)
+        self.synthesize_with_provider_and_format(
+            text,
+            &self.default_provider,
+            &self.default_voice,
+            &self.default_format,
+        )
             .await
     }
 
@@ -536,6 +565,19 @@ impl TtsManager {
         provider: &str,
         voice: &str,
     ) -> Result<Vec<u8>> {
+        self.synthesize_with_provider_and_format(text, provider, voice, &self.default_format)
+            .await
+    }
+
+    /// Synthesize text using a specific provider, voice, and output format.
+    pub async fn synthesize_with_provider_and_format(
+        &self,
+        text: &str,
+        provider: &str,
+        voice: &str,
+        format: &str,
+    ) -> Result<Vec<u8>> {
+        let normalized_format = normalize_tts_format(format);
         if text.is_empty() {
             bail!("TTS text must not be empty");
         }
@@ -556,7 +598,20 @@ impl TtsManager {
             )
         })?;
 
-        tts.synthesize(text, voice).await
+        if !tts
+            .supported_formats()
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(&normalized_format))
+        {
+            bail!(
+                "TTS provider '{}' does not support output format '{}' (available: {})",
+                provider,
+                normalized_format,
+                tts.supported_formats().join(", ")
+            );
+        }
+
+        tts.synthesize(text, voice, &normalized_format).await
     }
 
     /// List names of all initialized providers.
@@ -572,6 +627,31 @@ impl TtsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingProvider {
+        formats: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TtsProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        async fn synthesize(&self, _text: &str, _voice: &str, format: &str) -> Result<Vec<u8>> {
+            self.formats.lock().unwrap().push(format.to_string());
+            Ok(Vec::new())
+        }
+
+        fn supported_voices(&self) -> Vec<String> {
+            vec!["test-voice".to_string()]
+        }
+
+        fn supported_formats(&self) -> Vec<String> {
+            vec!["mp3".to_string(), "opus".to_string()]
+        }
+    }
 
     fn default_tts_config() -> TtsConfig {
         TtsConfig::default()
@@ -671,5 +751,54 @@ mod tests {
         config.max_text_length = 0;
         let manager = TtsManager::new(&config).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn tts_manager_uses_default_format_for_synthesis() {
+        let mut config = default_tts_config();
+        config.default_provider = "recording".to_string();
+        config.default_voice = "test-voice".to_string();
+        config.default_format = "opus".to_string();
+
+        let formats = Arc::new(Mutex::new(Vec::new()));
+        let mut providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
+        providers.insert(
+            "recording".to_string(),
+            Box::new(RecordingProvider {
+                formats: Arc::clone(&formats),
+            }),
+        );
+
+        let manager = TtsManager {
+            providers,
+            default_provider: config.default_provider.clone(),
+            default_voice: config.default_voice.clone(),
+            default_format: config.default_format.clone(),
+            max_text_length: DEFAULT_MAX_TEXT_LENGTH,
+        };
+
+        manager.synthesize("hello").await.unwrap();
+
+        assert_eq!(formats.lock().unwrap().as_slice(), ["opus"]);
+    }
+
+    #[tokio::test]
+    async fn tts_manager_rejects_unsupported_default_format() {
+        let mut config = default_tts_config();
+        config.default_provider = "edge".to_string();
+        config.default_format = "opus".to_string();
+        config.edge = Some(crate::config::EdgeTtsConfig {
+            binary_path: "edge-tts".into(),
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        let err = manager
+            .synthesize_with_provider("hello", "edge", "en-US-AriaNeural")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not support output format"),
+            "expected unsupported-format error, got: {err}"
+        );
     }
 }

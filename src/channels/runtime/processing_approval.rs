@@ -1,4 +1,5 @@
 use super::super::*;
+use super::keys::outbound_thread_ts;
 use super::processing_support::{
     approval_card_thread, approved_tool_args, channel_supports_lark_cards, find_tool_for_channel,
     parse_lark_card_action_content, summarize_tool_args_for_approval,
@@ -107,14 +108,14 @@ pub(crate) async fn handle_pending_approval_action(
     };
     let Some(approval) = get_pending_channel_approval(operation_id) else {
         let _ = channel
-            .send(
-                &SendMessage::new(
-                    "This approval request is no longer available. Please retry the original action.",
-                    &msg.reply_target,
+                .send(
+                    &SendMessage::new(
+                        "This approval request is no longer available. Please retry the original action.",
+                        &msg.reply_target,
+                    )
+                    .in_thread(outbound_thread_ts(&msg.channel, msg.thread_ts.clone())),
                 )
-                .in_thread(msg.thread_ts.clone()),
-            )
-            .await;
+                .await;
         return true;
     };
 
@@ -123,7 +124,7 @@ pub(crate) async fn handle_pending_approval_action(
             let _ = channel
                 .send(
                     &SendMessage::new(approval.preview.clone(), &approval.reply_target)
-                        .in_thread(approval.thread_ts.clone()),
+                        .in_thread(outbound_thread_ts(&msg.channel, approval.thread_ts.clone())),
                 )
                 .await;
         }
@@ -135,7 +136,7 @@ pub(crate) async fn handle_pending_approval_action(
                         format!("Rejected `{}`. No action was taken.", approval.tool_name),
                         &approval.reply_target,
                     )
-                    .in_thread(approval.thread_ts.clone()),
+                    .in_thread(outbound_thread_ts(&msg.channel, approval.thread_ts.clone())),
                 )
                 .await;
         }
@@ -155,7 +156,7 @@ pub(crate) async fn handle_pending_approval_action(
                             ),
                             &approval.reply_target,
                         )
-                        .in_thread(approval.thread_ts.clone()),
+                        .in_thread(outbound_thread_ts(&msg.channel, approval.thread_ts.clone())),
                     )
                     .await;
                 return true;
@@ -172,7 +173,7 @@ pub(crate) async fn handle_pending_approval_action(
             let _ = channel
                 .send(
                     &SendMessage::new(rendered, &approval.reply_target)
-                        .in_thread(approval.thread_ts.clone()),
+                        .in_thread(outbound_thread_ts(&msg.channel, approval.thread_ts.clone())),
                 )
                 .await;
         }

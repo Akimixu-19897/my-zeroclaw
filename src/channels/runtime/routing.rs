@@ -1,6 +1,6 @@
 use super::super::*;
 use super::config::runtime_defaults_snapshot;
-use super::keys::conversation_history_key;
+use super::keys::{conversation_history_key, outbound_thread_ts};
 use super::prompt::{
     normalize_cached_channel_turns, parse_runtime_command, resolve_provider_alias,
 };
@@ -388,7 +388,10 @@ pub(crate) async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send(
+            &SendMessage::new(response, &msg.reply_target)
+                .in_thread(outbound_thread_ts(&msg.channel, msg.thread_ts.clone())),
+        )
         .await
     {
         tracing::warn!(

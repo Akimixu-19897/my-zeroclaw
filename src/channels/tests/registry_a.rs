@@ -32,9 +32,32 @@ fn build_channel_system_prompt_includes_feishu_attachment_marker_guidance() {
         prompt.contains("[DOCUMENT:<absolute-path>]"),
         "feishu document marker guidance should be present"
     );
+    assert!(prompt.contains("[AUDIO:<absolute-path-or-url>]"));
+    assert!(prompt.contains("[VIDEO:<absolute-path-or-url>]"));
+    assert!(prompt.contains("generate and save the audio as `.ogg` or `.opus`"));
     assert!(
         prompt.contains("Do not write ad-hoc upload scripts"),
         "agent should be explicitly told not to create workaround scripts"
+    );
+    assert!(
+        prompt.contains("If the user already provided an exact absolute path"),
+        "feishu prompt should force direct marker delivery for exact file paths"
+    );
+    assert!(
+        prompt.contains("Do not call search/list/glob/shell tools just to rediscover that same path"),
+        "feishu prompt should discourage exploratory tool use for already-known paths"
+    );
+    assert!(
+        prompt.contains("do not paste its absolute path back to the user"),
+        "feishu prompt should forbid replying with raw generated file paths"
+    );
+    assert!(
+        prompt.contains("prefer one direct attachment-send tool call scoped to the current chat cache/workspace"),
+        "feishu prompt should steer path-less local media tests toward a single scoped send call"
+    );
+    assert!(
+        prompt.contains("exactly `NO_REPLY`"),
+        "feishu prompt should instruct the model to end current-chat delivery turns silently"
     );
 }
 
@@ -122,6 +145,99 @@ This is an example JSON object for profile settings."#;
 
     let result = strip_isolated_tool_json_artifacts(input, &known_tools);
     assert_eq!(result, input);
+}
+
+#[test]
+fn sanitize_channel_response_wraps_standalone_absolute_audio_paths_for_feishu() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("intro.m4a");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let result = sanitize_channel_response(
+        &audio_path.display().to_string(),
+        &[],
+        "feishu",
+    );
+
+    assert_eq!(result, format!("[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_wraps_quoted_absolute_audio_paths_for_feishu() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("intro.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("| {}", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "feishu");
+
+    assert_eq!(result, format!("[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_converts_media_directive_to_audio_marker_for_feishu() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("intro.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("如你所愿。\nMEDIA:{}", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "feishu");
+
+    assert_eq!(result, format!("如你所愿。\n[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_converts_quoted_media_directive_with_spaces_for_feishu() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("voice intro.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("MEDIA:\"{}\"", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "feishu");
+
+    assert_eq!(result, format!("[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_strips_audio_as_voice_tag_for_feishu() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("voice.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("[[audio_as_voice]]\nMEDIA:{}", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "feishu");
+
+    assert_eq!(result, format!("[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_drops_exact_silent_reply_token() {
+    let result = sanitize_channel_response("NO_REPLY", &[], "feishu");
+    assert!(result.is_empty());
+}
+
+#[test]
+fn sanitize_channel_response_keeps_media_while_stripping_silent_reply_token() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("voice.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("MEDIA:{}\nNO_REPLY", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "feishu");
+
+    assert_eq!(result, format!("[AUDIO:{}]", audio_path.display()));
+}
+
+#[test]
+fn sanitize_channel_response_converts_voice_media_directive_for_telegram() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let audio_path = tmp.path().join("voice.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let input = format!("[[audio_as_voice]]\nMEDIA:{}", audio_path.display());
+    let result = sanitize_channel_response(&input, &[], "telegram");
+
+    assert_eq!(result, format!("[VOICE:{}]", audio_path.display()));
 }
 
 // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
@@ -322,4 +438,3 @@ fn classify_health_ok_false() {
     let state = classify_health_result(&Ok(false));
     assert_eq!(state, ChannelHealthState::Unhealthy);
 }
-

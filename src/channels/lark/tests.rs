@@ -2,8 +2,13 @@ use super::*;
 use crate::channels::lark::cards::parse_lark_card_message;
 use crate::channels::lark::helpers::{detect_lark_ack_locale, map_locale_tag};
 use crate::channels::lark::inbound::{LarkInboundResource, LarkInboundResourceKind};
-use crate::channels::lark::media::store_inbound_resource_with_limit;
+use crate::channels::lark::media::{
+    store_inbound_resource, store_inbound_resource_with_limit,
+    LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES,
+};
+use crate::channels::lark::message_builders::build_lark_post_content;
 use crate::channels::lark::protocol::{LARK_DEFAULT_TOKEN_TTL, LARK_INVALID_ACCESS_TOKEN_CODE};
+use crate::channels::traits::SendMessage;
 use tempfile::TempDir;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -853,6 +858,16 @@ fn lark_parse_attachment_markers_extracts_audio_and_video() {
 }
 
 #[test]
+fn lark_parse_attachment_markers_treats_voice_as_audio() {
+    let (cleaned, attachments) = parse_lark_attachment_markers("[VOICE:/tmp/demo.ogg]");
+
+    assert!(cleaned.is_empty());
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].kind, LarkAttachmentKind::Audio);
+    assert_eq!(attachments[0].target, "/tmp/demo.ogg");
+}
+
+#[test]
 fn lark_parse_inbound_image_resource_extracts_file_key() {
     let resources = parse_lark_inbound_resources("image", "{\"image_key\":\"img_v3_demo\"}");
 
@@ -987,12 +1002,53 @@ fn lark_outbound_request_collects_local_attachments_and_text() {
     let outbound = LarkOutboundRequest::from_send_message(&message, &content);
 
     assert_eq!(outbound.target, "oc_chat123");
-    assert_eq!(outbound.local_images.len(), 1);
-    assert_eq!(outbound.local_documents.len(), 1);
+    assert_eq!(outbound.local_attachments.len(), 2);
+    assert_eq!(outbound.local_attachments[0].kind, LarkAttachmentKind::Image);
+    assert_eq!(outbound.local_attachments[1].kind, LarkAttachmentKind::Document);
     assert!(
         outbound.text.contains("请先看图"),
         "text segments should preserve surrounding text"
     );
+}
+
+#[test]
+fn lark_outbound_request_voice_marker_does_not_leave_text() {
+    let tmp = TempDir::new().unwrap();
+    let audio_path = tmp.path().join("voice.ogg");
+    std::fs::write(&audio_path, b"fake audio").unwrap();
+
+    let raw = format!("[VOICE:{}]", audio_path.display());
+    let msg = SendMessage::new(raw.clone(), "chat:oc_chat_1");
+    let outbound = LarkOutboundRequest::from_send_message(&msg, &raw);
+
+    assert!(outbound.text.is_empty(), "unexpected leftover text: {}", outbound.text);
+    assert_eq!(outbound.local_attachments.len(), 1);
+    assert_eq!(outbound.local_attachments[0].kind, LarkAttachmentKind::Audio);
+    assert_eq!(
+        outbound.local_attachments[0].target,
+        audio_path.display().to_string()
+    );
+}
+
+#[test]
+fn lark_outbound_request_preserves_local_audio_and_video_attachment_kinds() {
+    let dir = TempDir::new().unwrap();
+    let audio_path = dir.path().join("voice.ogg");
+    let video_path = dir.path().join("clip.mp4");
+    std::fs::write(&audio_path, b"fake-ogg").unwrap();
+    std::fs::write(&video_path, b"fake-mp4").unwrap();
+
+    let content = format!(
+        "发语音 [AUDIO:{}] 再发视频 [VIDEO:{}]",
+        audio_path.display(),
+        video_path.display()
+    );
+    let message = SendMessage::new(content.clone(), "oc_chat123");
+    let outbound = LarkOutboundRequest::from_send_message(&message, &content);
+
+    assert_eq!(outbound.local_attachments.len(), 2);
+    assert_eq!(outbound.local_attachments[0].kind, LarkAttachmentKind::Audio);
+    assert_eq!(outbound.local_attachments[1].kind, LarkAttachmentKind::Video);
 }
 
 #[test]
@@ -1021,6 +1077,24 @@ fn lark_outbound_request_preserves_thread_reply_target() {
 }
 
 #[test]
+fn lark_outbound_request_normalizes_prefixed_targets_like_official_plugin() {
+    let cases = [
+        ("chat:oc_chat123", "oc_chat123"),
+        ("user:ou_user123", "ou_user123"),
+        ("open_id:ou_user123", "ou_user123"),
+        ("feishu:ou_user123", "ou_user123"),
+        ("oc_chat123", "oc_chat123"),
+        ("ou_user123", "ou_user123"),
+    ];
+
+    for (raw_target, expected_target) in cases {
+        let message = SendMessage::new("hello", raw_target);
+        let outbound = LarkOutboundRequest::from_send_message(&message, "hello");
+        assert_eq!(outbound.target, expected_target, "raw target={raw_target}");
+    }
+}
+
+#[test]
 fn lark_outbound_request_collects_remote_attachment_markers() {
     let content = "看这个 [IMAGE:https://example.com/demo.png]";
     let message = SendMessage::new(content, "oc_chat123");
@@ -1040,6 +1114,38 @@ fn lark_parse_card_message_from_fenced_block() {
 
     assert_eq!(card.content["config"]["wide_screen_mode"], true);
     assert_eq!(card.content["elements"][0]["tag"], "markdown");
+}
+
+#[test]
+fn lark_parse_card_message_from_fenced_block_with_bare_elements() {
+    let raw = r#"```feishu-card
+{"elements":[{"tag":"markdown","content":"hello"}]}
+```"#;
+
+    let card = parse_lark_card_message(raw).expect("bare elements card should parse");
+
+    assert_eq!(card.content["elements"][0]["tag"], "markdown");
+    assert_eq!(card.content["elements"][0]["content"], "hello");
+}
+
+#[test]
+fn lark_parse_card_message_from_raw_json_text() {
+    let raw = r#"{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"hello"}]}}"#;
+
+    let card = parse_lark_card_message(raw).expect("raw card json should parse");
+
+    assert_eq!(card.content["schema"], "2.0");
+    assert_eq!(card.content["body"]["elements"][0]["tag"], "markdown");
+}
+
+#[test]
+fn lark_parse_card_message_unwraps_interactive_wrapper_like_official_plugin() {
+    let raw = r#"{"msg_type":"interactive","card":{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"wrapped"}]}}}"#;
+
+    let card = parse_lark_card_message(raw).expect("wrapped interactive card should parse");
+
+    assert_eq!(card.content["schema"], "2.0");
+    assert_eq!(card.content["body"]["elements"][0]["content"], "wrapped");
 }
 
 #[test]
@@ -1085,14 +1191,191 @@ fn lark_build_card_message_body_uses_interactive_type() {
 }
 
 #[test]
-fn lark_build_reply_message_body_sets_reply_in_thread() {
-    let body =
-        build_lark_reply_message_body("text", serde_json::json!({ "text": "hello thread" }), true);
+fn lark_build_text_message_body_uses_post_payload_like_official_plugin() {
+    let body = build_lark_text_message_body("oc_chat123", "hello **world**");
+    let content: serde_json::Value =
+        serde_json::from_str(body["content"].as_str().expect("content string")).unwrap();
 
-    assert_eq!(body["msg_type"], "text");
+    assert_eq!(body["receive_id"], "oc_chat123");
+    assert_eq!(body["msg_type"], "post");
     assert_eq!(
-        body["content"],
-        serde_json::json!({ "text": "hello thread" }).to_string()
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{ "tag": "md", "text": "hello **world**" }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_normalizes_common_at_mention_forms_like_official_plugin() {
+    let content = build_lark_post_content(
+        r#"<at id=all></at> <at open_id="ou_user1"></at> <at user_id=ou_user2>张三</at>"#,
+    );
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": r#"<at user_id="all"></at> <at user_id="ou_user1"></at> <at user_id="ou_user2">张三</at>"#,
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_applies_official_markdown_heading_downgrade() {
+    let content = build_lark_post_content("# Title\n## Section\nplain");
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "#### Title\n##### Section\nplain",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_strips_invalid_markdown_image_keys_like_official_plugin() {
+    let content = build_lark_post_content(
+        "![bad](local/path.png) ![good](img_v3_demo) ![url](https://example.com/a.png)",
+    );
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "local/path.png ![good](img_v3_demo) ![url](https://example.com/a.png)",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_converts_simple_markdown_table_to_bullets_like_official_plugin() {
+    let content =
+        build_lark_post_content("| Name | Value |\n|------|-------|\n| A | 1 |\n| B | 2 |");
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "**A**\n• Value: 1\n\n**B**\n• Value: 2",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_converts_multi_column_markdown_table_to_bullets_like_official_plugin() {
+    let content = build_lark_post_content(
+        "| Feature | SQLite | Postgres |\n|---------|--------|----------|\n| Speed | Fast | Medium |\n| Scale | Small | Large |",
+    );
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "**Speed**\n• SQLite: Fast\n• Postgres: Medium\n\n**Scale**\n• SQLite: Small\n• Postgres: Large",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_preserves_inline_styles_and_links_inside_markdown_table_cells() {
+    let content = build_lark_post_content(
+        "| Name | Value |\n|------|-------|\n| _Row_ | [Link](https://example.com) |",
+    );
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "**_Row_**\n• Value: [Link](https://example.com)",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_handles_empty_markdown_table_cells_like_official_plugin() {
+    let content = build_lark_post_content("| Name | Value |\n|------|-------|\n| A | |\n| B | 2 |");
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "**A**\n\n**B**\n• Value: 2",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_post_content_preserves_fenced_code_blocks_while_normalizing_text() {
+    let content =
+        build_lark_post_content("# Title\n```md\n# not-a-heading\n![bad](local.png)\n```");
+
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{
+                    "tag": "md",
+                    "text": "#### Title\n```md\n# not-a-heading\nlocal.png\n```",
+                }]]
+            }
+        })
+    );
+}
+
+#[test]
+fn lark_build_reply_message_body_sets_reply_in_thread() {
+    let body = build_lark_reply_message_body(
+        "post",
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{ "tag": "md", "text": "hello thread" }]]
+            }
+        }),
+        true,
+    );
+
+    assert_eq!(body["msg_type"], "post");
+    let content: serde_json::Value =
+        serde_json::from_str(body["content"].as_str().expect("content string")).unwrap();
+    assert_eq!(
+        content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{ "tag": "md", "text": "hello thread" }]]
+            }
+        })
     );
     assert_eq!(body["reply_in_thread"], true);
 }
@@ -1191,6 +1474,8 @@ async fn lark_materialize_outbound_attachment_accepts_file_url() {
     let resolved = materialize_outbound_attachment(
         &client,
         Some(workspace.path()),
+        LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES,
+        None,
         "feishu",
         "primary",
         LarkInboundResourceKind::Image,
@@ -1199,7 +1484,66 @@ async fn lark_materialize_outbound_attachment_accepts_file_url() {
     .await
     .expect("file URL should resolve to local path");
 
-    assert_eq!(resolved, local_file);
+    assert_eq!(resolved, std::fs::canonicalize(local_file).unwrap());
+}
+
+#[tokio::test]
+async fn lark_materialize_outbound_attachment_rejects_remote_content_length_over_limit() {
+    let server = MockServer::start().await;
+    let oversized = vec![b'x'; LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES + 1];
+    Mock::given(method("GET"))
+        .and(path("/demo/huge.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(oversized),
+        )
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let err = materialize_outbound_attachment(
+        &client,
+        None,
+        LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES,
+        None,
+        "feishu",
+        "primary",
+        LarkInboundResourceKind::File,
+        &format!("{}/demo/huge.bin", server.uri()),
+    )
+    .await
+    .expect_err("oversized remote media should be rejected");
+
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("size limit"), "unexpected error: {rendered}");
+}
+
+#[tokio::test]
+async fn lark_materialize_outbound_attachment_honors_configured_local_roots() {
+    let allowed_root = TempDir::new().unwrap();
+    let outside_root = TempDir::new().unwrap();
+    let outside_file = outside_root.path().join("demo.png");
+    std::fs::write(&outside_file, b"fake-png").unwrap();
+    let client = reqwest::Client::new();
+    let target = format!("file://{}", outside_file.display());
+
+    let err = materialize_outbound_attachment(
+        &client,
+        None,
+        LARK_DEFAULT_INBOUND_MEDIA_MAX_BYTES,
+        Some(vec![allowed_root.path().to_path_buf()]),
+        "feishu",
+        "primary",
+        LarkInboundResourceKind::Image,
+        &target,
+    )
+    .await
+    .expect_err("configured media_local_roots should restrict outbound attachment paths");
+
+    assert!(err
+        .to_string()
+        .contains("Local media path is not under an allowed directory"));
 }
 
 #[test]
@@ -1373,6 +1717,8 @@ fn lark_config_serde() {
         use_feishu: false,
         receive_mode: LarkReceiveMode::default(),
         port: None,
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
     let json = serde_json::to_string(&lc).unwrap();
     let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -1395,6 +1741,8 @@ fn lark_config_toml_roundtrip() {
         use_feishu: false,
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
     let toml_str = toml::to_string(&lc).unwrap();
     let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -1429,6 +1777,8 @@ fn lark_from_config_preserves_mode_and_region() {
         use_feishu: false,
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_config(&cfg);
@@ -1453,6 +1803,8 @@ fn lark_from_lark_config_ignores_legacy_feishu_flag() {
         use_feishu: true,
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_lark_config(&cfg);
@@ -1475,6 +1827,8 @@ fn lark_from_feishu_config_sets_feishu_platform() {
         allowed_users: vec!["*".into()],
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_feishu_config(&cfg);
@@ -1498,6 +1852,8 @@ fn lark_from_named_feishu_config_sets_account_identity() {
         allowed_users: vec!["*".into()],
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_named_feishu_config("feishu:primary".into(), &cfg);
@@ -1519,6 +1875,8 @@ fn lark_from_named_feishu_config_normalizes_prefixed_account_identity() {
         allowed_users: vec!["*".into()],
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_named_feishu_config(" Feishu:Primary ".into(), &cfg);
@@ -1540,6 +1898,8 @@ fn lark_named_feishu_health_component_name_is_account_scoped() {
         allowed_users: vec!["*".into()],
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let ch = LarkChannel::from_named_feishu_config("feishu:ops".into(), &cfg);
@@ -1560,6 +1920,8 @@ async fn lark_named_feishu_instances_do_not_share_runtime_caches() {
         allowed_users: vec!["*".into()],
         receive_mode: LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
 
     let primary = LarkChannel::from_named_feishu_config("feishu:primary".into(), &cfg);
@@ -1633,6 +1995,52 @@ fn lark_parse_inbound_message_preserves_thread_metadata_and_raw_content() {
     assert_eq!(parsed.raw_content, "{\"text\":\"hello thread\"}");
     assert_eq!(parsed.text, "hello thread");
     assert_eq!(parsed.normalized_content, "hello thread");
+}
+
+#[test]
+fn lark_parse_event_payload_reply_without_thread_id_does_not_set_thread_ts() {
+    let ch = with_bot_open_id(
+        LarkChannel::new(
+            "cli_app123".into(),
+            "secret456".into(),
+            "token789".into(),
+            None,
+            vec!["ou_user".into()],
+            false,
+        ),
+        "ou_bot",
+    );
+    let payload = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_user" } },
+            "message": {
+                "message_id": "om_reply_1",
+                "root_id": "om_root_1",
+                "parent_id": "om_parent_1",
+                "message_type": "text",
+                "content": "{\"text\":\"reply text\"}",
+                "chat_id": "oc_chat_1",
+                "chat_type": "group",
+                "create_time": "1700000000000",
+                "mentions": [{
+                    "id": { "open_id": "ou_bot" }
+                }]
+            }
+        }
+    });
+
+    let msgs = ch.parse_event_payload(&payload);
+
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].thread_ts, None);
+    assert_eq!(
+        msgs[0]
+            .context
+            .as_ref()
+            .and_then(|context| context.root_id.as_deref()),
+        Some("om_root_1")
+    );
 }
 
 #[test]
@@ -1710,6 +2118,45 @@ fn lark_parse_inbound_post_message_builds_official_markdown_content() {
     assert_eq!(parsed.resources[0].file_key, "img_v3_post");
 }
 
+#[test]
+fn lark_parse_inbound_flat_post_message_builds_markdown_content() {
+    let ch = with_bot_open_id(
+        LarkChannel::new(
+            "cli_app123".into(),
+            "secret456".into(),
+            "token789".into(),
+            None,
+            vec!["ou_user".into()],
+            false,
+        ),
+        "ou_bot",
+    );
+    let message = LarkMessage {
+        message_id: "om_post_flat_1".into(),
+        root_id: None,
+        parent_id: None,
+        thread_id: None,
+        create_time: Some("1700000000000".into()),
+        chat_id: "oc_chat_1".into(),
+        chat_type: "p2p".into(),
+        message_type: "post".into(),
+        content: "{\"title\":\"日报\",\"content\":[[{\"tag\":\"text\",\"text\":\"查看 \"},{\"tag\":\"img\",\"image_key\":\"img_v3_post\"}]]}".into(),
+        mentions: Vec::new(),
+    };
+
+    let parsed = ch
+        .parse_inbound_message("ou_user", &message)
+        .expect("flat post should parse");
+
+    assert_eq!(parsed.text, "日报\n\n查看");
+    assert_eq!(
+        parsed.normalized_content,
+        "**日报**\n\n查看 ![image](img_v3_post)"
+    );
+    assert_eq!(parsed.resources.len(), 1);
+    assert_eq!(parsed.resources[0].file_key, "img_v3_post");
+}
+
 #[tokio::test]
 async fn lark_parse_event_payload_async_fetches_full_interactive_card_content() {
     let server = MockServer::start().await;
@@ -1757,6 +2204,8 @@ async fn lark_parse_event_payload_async_fetches_full_interactive_card_content() 
         allowed_users: vec!["*".into()],
         receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
         port: None,
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     });
     ch.api_base_override = Some(server.uri());
 
@@ -1908,6 +2357,71 @@ async fn lark_parse_event_payload_async_downloads_file_resource_to_workspace() {
         std::path::Path::new(path).exists(),
         "downloaded file missing: {path}"
     );
+}
+
+#[tokio::test]
+async fn lark_parse_event_payload_async_includes_quoted_parent_message_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/im/v1/messages/om_parent_1"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "items": [{
+                    "message_id": "om_parent_1",
+                    "msg_type": "text",
+                    "body": { "content": "{\"text\":\"原始消息\"}" }
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let ch = with_cached_token(
+        with_test_api_base(
+            LarkChannel::new(
+                "cli_app123".into(),
+                "secret456".into(),
+                "token789".into(),
+                None,
+                vec!["*".into()],
+                true,
+            ),
+            &server.uri(),
+        ),
+        "tenant_token",
+    )
+    .await;
+
+    let payload = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_user" } },
+            "message": {
+                "message_id": "om_reply_1",
+                "message_type": "text",
+                "content": "{\"text\":\"这是回复内容\"}",
+                "parent_id": "om_parent_1",
+                "chat_id": "oc_chat_1",
+                "chat_type": "p2p",
+                "create_time": "1700000000000",
+                "mentions": []
+            }
+        }
+    });
+
+    let msgs = ch.parse_event_payload_async(&payload).await;
+
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        msgs[0]
+            .content
+            .contains("[quoted message om_parent_1]\n原始消息"),
+        "quoted content missing: {}",
+        msgs[0].content
+    );
+    assert!(msgs[0].content.contains("这是回复内容"));
 }
 
 #[test]
@@ -2340,6 +2854,8 @@ fn lark_reaction_url_matches_region() {
         allowed_users: vec!["*".into()],
         receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
         port: Some(9898),
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     };
     let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
     assert_eq!(
@@ -2673,6 +3189,156 @@ async fn lark_send_draft_sends_interactive_card_and_returns_message_id() {
         .expect("draft send should succeed");
 
     assert_eq!(message_id.as_deref(), Some("om_draft_1"));
+}
+
+#[tokio::test]
+async fn lark_send_text_to_open_id_target_uses_open_id_receive_id_type_and_post_payload() {
+    let server = MockServer::start().await;
+    let channel = with_cached_token(
+        with_test_api_base(make_channel(), &server.uri()),
+        "tenant_token",
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .and(query_param("receive_id_type", "open_id"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .and(body_string_contains(r#""receive_id":"ou_user123""#))
+        .and(body_string_contains(r#""msg_type":"post""#))
+        .and(body_string_contains(r#"\"tag\":\"md\""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_text_open_id_1"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    channel
+        .send(&SendMessage::new("hello open id", "open_id:ou_user123"))
+        .await
+        .expect("send should succeed");
+}
+
+#[tokio::test]
+async fn lark_send_text_to_chat_prefixed_target_uses_chat_id_receive_id_type() {
+    let server = MockServer::start().await;
+    let channel = with_cached_token(
+        with_test_api_base(make_channel(), &server.uri()),
+        "tenant_token",
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .and(body_string_contains(r#""receive_id":"oc_chat123""#))
+        .and(body_string_contains(r#""msg_type":"post""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_text_chat_1"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    channel
+        .send(&SendMessage::new("hello chat", "chat:oc_chat123"))
+        .await
+        .expect("send should succeed");
+}
+
+#[tokio::test]
+async fn lark_send_explicit_absolute_path_attachment_outside_default_roots_succeeds() {
+    let repo_root = std::env::current_dir().unwrap();
+    let outside = tempfile::tempdir_in(repo_root).unwrap();
+    let file_path = outside.path().join("report.pdf");
+    std::fs::write(&file_path, b"%PDF-1.4 fake").unwrap();
+
+    let server = MockServer::start().await;
+    let channel = with_cached_token(
+        with_test_api_base(make_channel(), &server.uri()),
+        "tenant_token",
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/files"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "file_key": "file_explicit_path_1"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .and(body_string_contains(r#""receive_id":"oc_chat123""#))
+        .and(body_string_contains(r#""msg_type":"file""#))
+        .and(body_string_contains(r#"\"file_key\":\"file_explicit_path_1\""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_file_explicit_1"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    channel
+        .send(&SendMessage::new(
+            format!("[DOCUMENT:{}]", file_path.display()),
+            "chat:oc_chat123",
+        ))
+        .await
+        .expect("send should succeed");
+}
+
+#[tokio::test]
+async fn lark_send_raw_card_json_routes_to_interactive_message_like_official_plugin() {
+    let server = MockServer::start().await;
+    let channel = with_cached_token(
+        with_test_api_base(make_channel(), &server.uri()),
+        "tenant_token",
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer tenant_token"))
+        .and(body_string_contains(r#""msg_type":"interactive""#))
+        .and(body_string_contains(r#"\"schema\":\"2.0\""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_card_1"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    channel
+        .send(&SendMessage::new(
+            r#"{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"card body"}]}}"#,
+            "oc_chat123",
+        ))
+        .await
+        .expect("card send should succeed");
 }
 
 #[tokio::test]

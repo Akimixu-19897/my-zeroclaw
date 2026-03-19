@@ -77,7 +77,7 @@ use runtime::registry::collect_configured_channels;
 #[cfg(test)]
 #[allow(unused_imports)]
 use runtime::routing::should_skip_memory_context_entry;
-pub(crate) use runtime::text::strip_tool_call_tags;
+pub(crate) use runtime::text::{normalize_channel_markdown_text, strip_tool_call_tags};
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;

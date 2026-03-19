@@ -1393,6 +1393,8 @@ mod tests {
             allowed_users: Vec::new(),
             port: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let mut items = Vec::new();

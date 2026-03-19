@@ -3390,6 +3390,8 @@ fn migrate_legacy_feishu_channels_config(mut config: ChannelsConfig) -> Channels
         allowed_users: lark.allowed_users.clone(),
         receive_mode: lark.receive_mode.clone(),
         port: lark.port,
+        media_max_mb: lark.media_max_mb,
+        media_local_roots: lark.media_local_roots.clone(),
     });
     config.lark = None;
     config
@@ -4976,6 +4978,8 @@ fn setup_channels_with_existing(config: ChannelsConfig) -> Result<ChannelsConfig
                         allowed_users,
                         receive_mode,
                         port,
+                        media_max_mb: None,
+                        media_local_roots: Vec::new(),
                     });
                 } else {
                     config.lark = Some(LarkConfig {
@@ -4988,6 +4992,8 @@ fn setup_channels_with_existing(config: ChannelsConfig) -> Result<ChannelsConfig
                         use_feishu: false,
                         receive_mode,
                         port,
+                        media_max_mb: None,
+                        media_local_roots: Vec::new(),
                     });
                 }
             }
@@ -7244,6 +7250,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         assert!(has_launchable_channels(&channels));
     }
@@ -7261,6 +7269,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(8080),
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let migrated = migrate_legacy_feishu_channels_config(channels);
@@ -7291,6 +7301,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(8080),
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         channels.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_native".into(),
@@ -7301,6 +7313,8 @@ mod tests {
             allowed_users: vec!["ou_native".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let migrated = migrate_legacy_feishu_channels_config(channels);

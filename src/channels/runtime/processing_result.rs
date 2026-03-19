@@ -1,4 +1,5 @@
 use super::super::*;
+use super::keys::outbound_thread_ts;
 use super::processing_approval::send_pending_approval_message;
 use super::processing_support::{
     approval_card_thread, extract_tool_context_summary, parse_pending_channel_approval_request,
@@ -8,6 +9,7 @@ use super::routing::{
     append_sender_turn, compact_sender_history, is_context_window_overflow_error,
     rollback_orphan_user_turn,
 };
+use super::text::{is_silent_reply_text, strip_trailing_silent_reply_token};
 use crate::agent::loop_::scrub_credentials;
 use crate::observability::runtime_trace;
 use crate::util::truncate_with_ellipsis;
@@ -177,10 +179,16 @@ async fn handle_success(outcome: ProcessingOutcomeContext, response: String) {
         return;
     }
 
-    let sanitized_response =
-        sanitize_channel_response(&outbound_response, outcome.ctx.tools_registry.as_ref());
+    let silent_reply_requested = is_silent_reply_text(&outbound_response)
+        || strip_trailing_silent_reply_token(&outbound_response) != outbound_response.trim();
+    let sanitized_response = sanitize_channel_response(
+        &outbound_response,
+        outcome.ctx.tools_registry.as_ref(),
+        &outcome.msg.channel,
+    );
     let delivered_response = if sanitized_response.is_empty()
         && !outbound_response.trim().is_empty()
+        && !silent_reply_requested
     {
         "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
     } else {
@@ -214,14 +222,28 @@ async fn handle_success(outcome: ProcessingOutcomeContext, response: String) {
         &outcome.history_key,
         ChatMessage::assistant(&history_response),
     );
-    println!(
-        "  🤖 Reply ({}ms): {}",
-        outcome.started_at.elapsed().as_millis(),
-        truncate_with_ellipsis(&delivered_response, 80)
-    );
+    if delivered_response.is_empty() && silent_reply_requested {
+        println!(
+            "  🤖 Reply ({}ms): [silent]",
+            outcome.started_at.elapsed().as_millis()
+        );
+    } else {
+        println!(
+            "  🤖 Reply ({}ms): {}",
+            outcome.started_at.elapsed().as_millis(),
+            truncate_with_ellipsis(&delivered_response, 80)
+        );
+    }
 
     if let Some(channel) = outcome.target_channel.as_ref() {
-        if let Some(draft_id) = outcome.draft_message_id.as_deref() {
+        if delivered_response.is_empty() && silent_reply_requested {
+            cancel_draft_if_present(
+                Some(channel),
+                &outcome.msg.reply_target,
+                outcome.draft_message_id.as_deref(),
+            )
+            .await;
+        } else if let Some(draft_id) = outcome.draft_message_id.as_deref() {
             if let Err(error) = channel
                 .finalize_draft(&outcome.msg.reply_target, draft_id, &delivered_response)
                 .await
@@ -230,14 +252,18 @@ async fn handle_success(outcome: ProcessingOutcomeContext, response: String) {
                 let _ = channel
                     .send(
                         &SendMessage::new(&delivered_response, &outcome.msg.reply_target)
-                            .in_thread(outcome.msg.thread_ts.clone()),
+                            .in_thread(outbound_thread_ts(
+                                &outcome.msg.channel,
+                                outcome.msg.thread_ts.clone(),
+                            )),
                     )
                     .await;
             }
         } else if let Err(error) = channel
             .send(
-                &SendMessage::new(delivered_response, &outcome.msg.reply_target)
-                    .in_thread(outcome.msg.thread_ts.clone()),
+                &SendMessage::new(delivered_response, &outcome.msg.reply_target).in_thread(
+                    outbound_thread_ts(&outcome.msg.channel, outcome.msg.thread_ts.clone()),
+                ),
             )
             .await
         {
@@ -426,7 +452,10 @@ async fn deliver_error_text(
             .await;
     } else {
         let _ = channel
-            .send(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .send(
+                &SendMessage::new(text, &msg.reply_target)
+                    .in_thread(outbound_thread_ts(&msg.channel, msg.thread_ts.clone())),
+            )
             .await;
     }
 }

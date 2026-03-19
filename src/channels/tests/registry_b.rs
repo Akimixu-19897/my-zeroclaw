@@ -68,6 +68,8 @@ fn collect_configured_channels_includes_named_feishu_accounts() {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         },
     );
 
@@ -95,6 +97,8 @@ fn collect_configured_channels_excludes_disabled_feishu_accounts() {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         },
     );
 
@@ -226,4 +230,3 @@ async fn supervised_listener_refreshes_health_while_running() {
     assert!(join.is_ok(), "listener should stop after channel shutdown");
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
-

@@ -6,6 +6,13 @@ use super::{
 use crate::channels::traits::SendMessage;
 use std::path::{Path, PathBuf};
 
+const LARK_CHAT_PREFIX: &str = "oc_";
+const LARK_OPEN_ID_PREFIX: &str = "ou_";
+const LARK_TAG_CHAT: &str = "chat:";
+const LARK_TAG_USER: &str = "user:";
+const LARK_TAG_OPEN_ID: &str = "open_id:";
+const LARK_TAG_FEISHU: &str = "feishu:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LarkAttachmentSource {
     Local(PathBuf),
@@ -17,8 +24,7 @@ pub(crate) struct LarkOutboundRequest {
     pub(crate) target: String,
     pub(crate) text: String,
     pub(crate) card: Option<LarkCardMessage>,
-    pub(crate) local_images: Vec<PathBuf>,
-    pub(crate) local_documents: Vec<PathBuf>,
+    pub(crate) local_attachments: Vec<LarkAttachment>,
     pub(crate) remote_attachments: Vec<(LarkAttachmentKind, String)>,
     pub(crate) unresolved_markers: Vec<String>,
     pub(crate) path_only_attachment: Option<LarkAttachment>,
@@ -29,11 +35,11 @@ impl LarkOutboundRequest {
     pub(crate) fn from_send_message(message: &SendMessage, raw_content: &str) -> Self {
         if let Some(card) = parse_lark_card_message(raw_content) {
             return Self {
-                target: message.recipient.clone(),
+                target: normalize_lark_target(&message.recipient)
+                    .unwrap_or_else(|| message.recipient.clone()),
                 text: String::new(),
                 card: Some(card),
-                local_images: Vec::new(),
-                local_documents: Vec::new(),
+                local_attachments: Vec::new(),
                 remote_attachments: Vec::new(),
                 unresolved_markers: Vec::new(),
                 path_only_attachment: None,
@@ -42,7 +48,7 @@ impl LarkOutboundRequest {
         }
 
         let (cleaned_content, parsed_attachments) = parse_lark_attachment_markers(raw_content);
-        let (local_images, local_documents, unresolved_markers) =
+        let (local_attachments, unresolved_markers) =
             classify_lark_outgoing_attachments(&parsed_attachments);
         let remote_attachments: Vec<(LarkAttachmentKind, String)> = parsed_attachments
             .iter()
@@ -66,11 +72,11 @@ impl LarkOutboundRequest {
         }
 
         Self {
-            target: message.recipient.clone(),
+            target: normalize_lark_target(&message.recipient)
+                .unwrap_or_else(|| message.recipient.clone()),
             text: text_segments.join("\n"),
             card: None,
-            local_images,
-            local_documents,
+            local_attachments,
             remote_attachments,
             unresolved_markers,
             path_only_attachment: parse_lark_path_only_attachment(raw_content),
@@ -79,7 +85,7 @@ impl LarkOutboundRequest {
     }
 
     pub(crate) fn has_local_attachments(&self) -> bool {
-        !self.local_images.is_empty() || !self.local_documents.is_empty()
+        !self.local_attachments.is_empty()
     }
 
     pub(crate) fn has_remote_attachments(&self) -> bool {
@@ -95,6 +101,42 @@ impl LarkOutboundRequest {
         self.thread_ts
             .as_deref()
             .filter(|value| !value.trim().is_empty())
+    }
+}
+
+pub(crate) fn normalize_lark_target(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(inner) = trimmed.strip_prefix(LARK_TAG_FEISHU) {
+        let normalized = inner.trim();
+        return (!normalized.is_empty()).then(|| normalized.to_string());
+    }
+    if let Some(inner) = trimmed.strip_prefix(LARK_TAG_CHAT) {
+        let normalized = inner.trim();
+        return (!normalized.is_empty()).then(|| normalized.to_string());
+    }
+    if let Some(inner) = trimmed.strip_prefix(LARK_TAG_USER) {
+        let normalized = inner.trim();
+        return (!normalized.is_empty()).then(|| normalized.to_string());
+    }
+    if let Some(inner) = trimmed.strip_prefix(LARK_TAG_OPEN_ID) {
+        let normalized = inner.trim();
+        return (!normalized.is_empty()).then(|| normalized.to_string());
+    }
+
+    Some(trimmed.to_string())
+}
+
+pub(crate) fn resolve_lark_receive_id_type(target: &str) -> &'static str {
+    if target.starts_with(LARK_CHAT_PREFIX) {
+        "chat_id"
+    } else if target.starts_with(LARK_OPEN_ID_PREFIX) {
+        "open_id"
+    } else {
+        "open_id"
     }
 }
 

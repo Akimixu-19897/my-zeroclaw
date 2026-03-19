@@ -265,6 +265,8 @@ mod tests {
                     allowed_users: vec!["*".to_string()],
                     receive_mode: LarkReceiveMode::default(),
                     port: None,
+                    media_max_mb: None,
+                    media_local_roots: Vec::new(),
                 }),
                 ..ChannelsConfig::default()
             },

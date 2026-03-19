@@ -28,26 +28,48 @@ pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'stat
             "When responding on Feishu:\n\
              - Use channel attachment markers instead of writing one-off upload scripts.\n\
              - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - If the user already provided an exact absolute path or exact URL for a file/image, reply with the matching channel marker directly.\n\
+             - If you generated a local media file during this turn, do not paste its absolute path back to the user; send it with a channel marker instead.\n\
+             - Do not call search/list/glob/shell tools just to rediscover that same path.\n\
+             - If the user asks for any local image/file for testing but did not provide a path, prefer one direct attachment-send tool call scoped to the current chat cache/workspace over generic filesystem exploration.\n\
              - For images use [IMAGE:<absolute-path-or-url>].\n\
              - For files use [DOCUMENT:<absolute-path>] or [FILE:<absolute-path>].\n\
+             - For audio use [AUDIO:<absolute-path-or-url>] or [VOICE:<absolute-path-or-url>].\n\
+             - If the user wants a Feishu voice/audio message, generate and save the audio as `.ogg` or `.opus` before sending.\n\
+             - Do not generate `mp3` or `m4a` for Feishu voice-style delivery.\n\
+             - For video use [VIDEO:<absolute-path-or-url>].\n\
              - Keep explanatory text outside markers and never wrap markers in code fences.\n\
              - If a local file already exists in the workspace or on disk, reference it directly with a marker instead of re-uploading it manually from a tool.\n\
+             - If a tool already delivered the requested content into this same Feishu chat, end the turn with exactly `NO_REPLY`.\n\
+             - After a successful current-chat send, do not send another confirmation message and do not call another send tool unless the first send failed.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "lark" => Some(
             "When responding on Lark:\n\
              - Use channel attachment markers instead of writing one-off upload scripts.\n\
              - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - If the user already provided an exact absolute path or exact URL for a file/image, reply with the matching channel marker directly.\n\
+             - If you generated a local media file during this turn, do not paste its absolute path back to the user; send it with a channel marker instead.\n\
+             - Do not call search/list/glob/shell tools just to rediscover that same path.\n\
+             - If the user asks for any local image/file for testing but did not provide a path, prefer one direct attachment-send tool call scoped to the current chat cache/workspace over generic filesystem exploration.\n\
              - For images use [IMAGE:<absolute-path-or-url>].\n\
              - For files use [DOCUMENT:<absolute-path>] or [FILE:<absolute-path>].\n\
+             - For audio use [AUDIO:<absolute-path-or-url>] or [VOICE:<absolute-path-or-url>].\n\
+             - If the user wants a Lark voice/audio message, generate and save the audio as `.ogg` or `.opus` before sending.\n\
+             - Do not generate `mp3` or `m4a` for Lark voice-style delivery.\n\
+             - For video use [VIDEO:<absolute-path-or-url>].\n\
              - Keep explanatory text outside markers and never wrap markers in code fences.\n\
              - If a local file already exists in the workspace or on disk, reference it directly with a marker instead of re-uploading it manually from a tool.\n\
+             - If a tool already delivered the requested content into this same Lark chat, end the turn with exactly `NO_REPLY`.\n\
+             - After a successful current-chat send, do not send another confirmation message and do not call another send tool unless the first send failed.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "wecom" => Some(
             "When responding on WeCom:\n\
              - Use channel attachment markers instead of writing one-off upload scripts.\n\
              - Do not write ad-hoc upload scripts, temp automation glue, or direct HTTP upload code when a channel marker can express the attachment.\n\
+             - If the user already provided an exact absolute path or exact URL for an image, reply with the matching channel marker directly.\n\
+             - Do not call search/list/glob/shell tools just to rediscover that same path.\n\
              - For images use [IMAGE:<absolute-path-or-url>].\n\
              - Keep explanatory text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",

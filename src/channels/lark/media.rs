@@ -1,4 +1,7 @@
 use super::inbound::{LarkInboundResource, LarkInboundResourceKind};
+use super::media_source::{
+    build_outbound_media_load_options, load_outbound_media, LoadedOutboundMedia, LocalPathPolicy,
+};
 use anyhow::{Context, Result};
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use std::path::{Path, PathBuf};
@@ -220,53 +223,88 @@ pub(crate) fn content_type_from_response(response: &reqwest::Response) -> Option
 pub(crate) async fn materialize_outbound_attachment(
     client: &reqwest::Client,
     workspace_dir: Option<&Path>,
+    media_max_bytes: usize,
+    media_local_roots: Option<Vec<PathBuf>>,
     channel_name: &str,
     account_id: &str,
     kind: LarkInboundResourceKind,
     target: &str,
 ) -> Result<PathBuf> {
-    if let Some(path) = target.strip_prefix("file://") {
-        let file_path = PathBuf::from(path);
-        if !file_path.is_file() {
-            anyhow::bail!("Lark outbound file URL is not a readable file: {target}");
+    match load_outbound_media(
+        client,
+        target,
+        &build_outbound_media_load_options(
+            media_max_bytes,
+            workspace_dir,
+            media_local_roots,
+            LocalPathPolicy::DefaultRoots,
+        ),
+    )
+    .await?
+    {
+        LoadedOutboundMedia::LocalPath(path) => Ok(path),
+        LoadedOutboundMedia::Downloaded(remote) => {
+            materialize_remote_attachment(
+                workspace_dir,
+                media_max_bytes,
+                channel_name,
+                account_id,
+                kind,
+                remote,
+            )
+            .await
         }
-        return Ok(file_path);
+        LoadedOutboundMedia::InMemory(local) => {
+            let file_name = local
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string);
+            materialize_remote_attachment(
+                workspace_dir,
+                media_max_bytes,
+                channel_name,
+                account_id,
+                kind,
+                super::media_source::DownloadedRemoteMedia {
+                    bytes: local.bytes,
+                    content_type: mime_guess::from_path(&local.path)
+                        .first_raw()
+                        .map(str::to_string),
+                    file_name,
+                },
+            )
+            .await
+        }
     }
+}
 
-    let response = client
-        .get(target)
-        .send()
-        .await
-        .with_context(|| format!("download Lark outbound attachment {target}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("download Lark outbound attachment failed with status {status}");
-    }
-
-    let content_type = content_type_from_response(&response);
-    let file_name = extract_response_file_name(&response);
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("read Lark outbound attachment body {target}"))?;
-
+async fn materialize_remote_attachment(
+    workspace_dir: Option<&Path>,
+    media_max_bytes: usize,
+    channel_name: &str,
+    account_id: &str,
+    kind: LarkInboundResourceKind,
+    remote: super::media_source::DownloadedRemoteMedia,
+) -> Result<PathBuf> {
     let storage_root = workspace_dir
         .map(ToOwned::to_owned)
         .unwrap_or_else(std::env::temp_dir);
     let resource = LarkInboundResource {
         kind,
         file_key: format!("outbound_{}", current_timestamp_millis()),
-        file_name,
+        file_name: remote.file_name.clone(),
     };
-    let stored = store_inbound_resource(
+    let stored = store_inbound_resource_with_limit(
         &storage_root,
         channel_name,
         account_id,
         "outbound",
         &resource,
-        bytes.as_ref(),
-        content_type.as_deref(),
+        remote.bytes.as_ref(),
+        remote.content_type.as_deref(),
         resource.file_name.as_deref(),
+        media_max_bytes,
     )
     .await?;
     Ok(stored.path)

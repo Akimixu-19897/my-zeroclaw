@@ -1,4 +1,5 @@
 use super::super::*;
+use super::text::strip_trailing_silent_reply_token;
 
 pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
     fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
@@ -90,12 +91,158 @@ pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index:
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    channel_name: &str,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    let stripped = strip_isolated_tool_json_artifacts(response, &known_tool_names);
+    let stripped = strip_trailing_silent_reply_token(&stripped);
+    let media_directive_normalized = normalize_media_directives(&stripped, channel_name);
+    auto_wrap_channel_attachment_paths(&media_directive_normalized, channel_name)
+}
+
+fn normalize_media_directives(message: &str, channel_name: &str) -> String {
+    let normalized = channel_name.split(':').next().unwrap_or(channel_name);
+    if !matches!(normalized, "feishu" | "lark" | "telegram") {
+        return message.to_string();
+    }
+
+    let mut audio_as_voice = false;
+    let mut kept_lines = Vec::new();
+    let mut attachment_lines = Vec::new();
+
+    for line in message.lines() {
+        if strip_audio_as_voice_tag(line, &mut audio_as_voice) {
+            continue;
+        }
+        if let Some(path) = parse_media_directive_path(line) {
+            if let Some(kind) = detect_attachment_marker_kind_for_channel(
+                normalized,
+                path,
+                audio_as_voice,
+            ) {
+                attachment_lines.push(format!("[{kind}:{path}]"));
+                continue;
+            }
+        }
+        kept_lines.push(line.to_string());
+    }
+
+    if attachment_lines.is_empty() {
+        return message.to_string();
+    }
+
+    let mut result_lines = kept_lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    result_lines.extend(attachment_lines);
+    result_lines.join("\n")
+}
+
+fn strip_audio_as_voice_tag(line: &str, audio_as_voice: &mut bool) -> bool {
+    let trimmed = line.trim();
+    if trimmed.eq_ignore_ascii_case("[[audio_as_voice]]") {
+        *audio_as_voice = true;
+        return true;
+    }
+    false
+}
+
+fn parse_media_directive_path(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let payload = trimmed.strip_prefix("MEDIA:")?.trim();
+    if payload.is_empty() {
+        return None;
+    }
+
+    let unquoted = payload
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| payload.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+        .or_else(|| payload.strip_prefix('`').and_then(|value| value.strip_suffix('`')))
+        .unwrap_or(payload)
+        .trim();
+
+    (!unquoted.is_empty()).then_some(unquoted)
+}
+
+fn detect_attachment_marker_kind_for_channel(
+    channel_name: &str,
+    path: &str,
+    audio_as_voice: bool,
+) -> Option<&'static str> {
+    let kind = detect_attachment_marker_kind_from_path(path)?;
+    if channel_name == "telegram" && audio_as_voice && kind == "AUDIO" {
+        return Some("VOICE");
+    }
+    Some(kind)
+}
+
+fn auto_wrap_channel_attachment_paths(message: &str, channel_name: &str) -> String {
+    let normalized = channel_name.split(':').next().unwrap_or(channel_name);
+    if !matches!(normalized, "feishu" | "lark") {
+        return message.to_string();
+    }
+
+    let mut changed = false;
+    let lines = message
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if let Some((marker_kind, path)) = detect_attachment_marker_kind_from_line(trimmed) {
+                changed = true;
+                format!("[{marker_kind}:{path}]")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if changed {
+        lines.join("\n")
+    } else {
+        message.to_string()
+    }
+}
+
+fn detect_attachment_marker_kind_from_line(line: &str) -> Option<(&'static str, &str)> {
+    let candidate = extract_attachment_path_candidate(line)?;
+    let marker_kind = detect_attachment_marker_kind_from_path(candidate)?;
+    Some((marker_kind, candidate))
+}
+
+fn extract_attachment_path_candidate(line: &str) -> Option<&str> {
+    let candidate = line
+        .trim()
+        .trim_start_matches(|ch: char| matches!(ch, '|' | '>' | '-' | '*' | '`'))
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`'));
+
+    (!candidate.is_empty()).then_some(candidate)
+}
+
+fn detect_attachment_marker_kind_from_path(path_str: &str) -> Option<&'static str> {
+    let path = std::path::Path::new(path_str);
+    if !path.is_absolute() || !path.exists() {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif" | "heic" => {
+            Some("IMAGE")
+        }
+        "ogg" | "opus" | "mp3" | "wav" | "m4a" | "aac" | "flac" | "oga" | "webm" => {
+            Some("AUDIO")
+        }
+        "mp4" | "mov" | "avi" | "mkv" => Some("VIDEO"),
+        _ => Some("DOCUMENT"),
+    }
 }
 
 pub(crate) fn extract_fenced_block<'a>(content: &'a str, language: &str) -> Option<&'a str> {
@@ -138,6 +285,10 @@ pub(crate) fn parse_lark_card_action_content(content: &str) -> Option<ParsedChan
 }
 
 pub(crate) fn approval_card_thread(message: &traits::ChannelMessage) -> Option<String> {
+    if channel_uses_flat_replies(&message.channel) {
+        return None;
+    }
+
     message
         .thread_ts
         .clone()
@@ -458,3 +609,4 @@ pub(crate) fn spawn_scoped_typing_task(
 
     handle
 }
+use super::keys::channel_uses_flat_replies;

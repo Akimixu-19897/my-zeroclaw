@@ -2,7 +2,7 @@ use super::super::*;
 use super::config::{maybe_apply_runtime_config_update, runtime_defaults_snapshot};
 use super::keys::{
     conversation_history_key, conversation_memory_key, final_reply_thread_ts_after_tool_updates,
-    inbound_display_sender, inbound_user_message_body,
+    inbound_display_sender, inbound_user_message_body, outbound_thread_ts,
     should_forward_tool_events_as_thread_messages,
 };
 use super::notify::ChannelNotifyObserver;
@@ -19,6 +19,7 @@ use super::routing::{
 use crate::agent::loop_::run_tool_call_loop;
 use crate::observability::runtime_trace;
 use crate::util::truncate_with_ellipsis;
+use serde_json::json;
 
 struct ProcessingSupportHandles {
     draft_message_id: Option<String>,
@@ -303,6 +304,7 @@ async fn setup_processing_supports(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                channel_tool_execution_context(&msg),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -322,6 +324,33 @@ async fn setup_processing_supports(
     )
 }
 
+fn channel_tool_execution_context(msg: &traits::ChannelMessage) -> Option<serde_json::Value> {
+    let current_channel_id = msg
+        .context
+        .as_ref()
+        .and_then(|context| context.origin_to.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!msg.reply_target.trim().is_empty()).then(|| msg.reply_target.clone()));
+    let current_message_id = (!msg.id.trim().is_empty()).then(|| msg.id.clone());
+    let current_thread_ts = msg
+        .context
+        .as_ref()
+        .and_then(|context| context.thread_id.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| msg.thread_ts.clone());
+
+    if current_channel_id.is_none() && current_message_id.is_none() && current_thread_ts.is_none() {
+        return None;
+    }
+
+    Some(json!({
+        "current_channel_name": msg.channel,
+        "current_channel_id": current_channel_id,
+        "current_message_id": current_message_id,
+        "current_thread_ts": current_thread_ts,
+    }))
+}
+
 async fn create_draft_message(
     target_channel: Option<&Arc<dyn Channel>>,
     msg: &traits::ChannelMessage,
@@ -333,7 +362,10 @@ async fn create_draft_message(
 
     let channel = target_channel?;
     match channel
-        .send_draft(&SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send_draft(
+            &SendMessage::new("...", &msg.reply_target)
+                .in_thread(outbound_thread_ts(&msg.channel, msg.thread_ts.clone())),
+        )
         .await
     {
         Ok(id) => id,
@@ -481,7 +513,10 @@ async fn send_provider_init_error(
     );
     if let Some(channel) = target_channel {
         let _ = channel
-            .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .send(
+                &SendMessage::new(message, &msg.reply_target)
+                    .in_thread(outbound_thread_ts(&msg.channel, msg.thread_ts.clone())),
+            )
             .await;
     }
 }

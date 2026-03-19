@@ -631,55 +631,132 @@ cargo test channels::lark::tests:: --lib
 
 ### Phase 1.5: Unified Outbound Request Model
 
-状态：进行中，内部出站请求规范化已经落地，同时保留了当前 marker/path 行为。
+状态：已完成。
+
+说明：
+
+- 按本计划文档中 `Phase 1.5: Unified Outbound Request Model` 的目标范围，现阶段可以记为“已完成”。
+- 但如果标准是“与官方 `@larksuite/openclaw-lark` 在实现细节上 100% 完全一致”，则仍未达到。
+- 当前剩余差异主要集中在官方 media 安全与运行时细节，例如 SSRF 防护、`mediaLocalRoots` 本地路径白名单、媒体时长探测，以及我们并未复用官方 Node adapter/runtime 的同一条代码路径。
+
+对齐依据：
+
+- `Desktop/projects/openclaw-lark/src/core/targets.js`
+- `Desktop/projects/openclaw-lark/src/messaging/outbound/actions.js`
+- `Desktop/projects/openclaw-lark/src/messaging/outbound/deliver.js`
+
+结构收口：
+
+- 共享文本预处理已下沉到 `src/channels/runtime/text.rs`
+- `src/channels/lark/message_builders.rs` 仅保留飞书消息体封装
+- 这样后续继续对齐官方 markdown 文本行为时，不需要再把逻辑堆回 Lark 私有模块
+
+本阶段已对齐的官方行为：
+
+- target 归一化：
+  - 支持 `chat:oc_xxx`
+  - 支持 `user:...`
+  - 支持 `open_id:ou_xxx`
+  - 支持 `feishu:ou_xxx`
+  - 支持原生 `oc_*` / `ou_*`
+- `receive_id_type` 推断：
+  - `oc_*` -> `chat_id`
+  - `ou_*` -> `open_id`
+  - 其他默认走 `open_id`
+- 文本发送语义：
+  - 文本消息默认发送为 `post`
+  - reply 文本也发送为 `post`
+  - `<at id=...>` / `<at open_id=...>` / `<at user_id=...>` 会规范化成官方兼容的 `<at user_id="...">`
+  - 标题降级与无效 markdown 图片 key 清理，已按官方 `optimizeMarkdownStyle(..., 1)` 对齐
+  - markdown table 已增加本地 `bullets` 模式转换，覆盖 Feishu 常见表格文本发送场景
+- card 自动识别：
+  - fenced `lark-card` / `feishu-card`
+  - 整段原始 card JSON
+  - wrapped interactive JSON
+- 统一 `send` 参数读取：
+  - `to`
+  - `message` / `text`
+  - `media` / `path` / `filePath` / `url`
+  - `fileName` / `name`
+  - `replyTo` / `reply_to`
+  - `card`
+- `feishu_im_message` 工具的统一发送语义：
+  - 同一个 `send` 入口可处理 text / card / media
+  - text + card 或 text + media 时，会先发文本，再发 card/media
+  - media 上传失败时，会退化为发送媒体链接文本
+- 保留我们现有的 marker/path 附件发送能力，并统一挂到同一个内部出站请求模型下
+- `feishu_im_message` 工具已同步切换为 `post` + 动态 `receive_id_type`
+
+本阶段仍未与官方 100% 等价的点：
+
+- 目前的 markdown table 转换是 Rust 侧本地实现，不是官方 OpenClaw runtime 里的同一套 IR/render 管线
+- 官方插件的 media SSRF 防护、`mediaLocalRoots` 本地路径白名单与媒体时长探测，这一轮没有完整复刻到工具发送层
+- 当前仍是 Rust 本地 channel/tool 组合实现，不是官方 Node adapter/runtime 的同一套代码路径
 
 **文件：**
 
-- 修改：`src/channels/lark.rs`
-- 新建：`src/channels/lark_outbound.rs`
-- 测试：`src/channels/lark.rs`
+- 修改：`src/channels/lark/outbound.rs`
+- 修改：`src/channels/lark/cards.rs`
+- 修改：`src/channels/lark/message_builders.rs`
+- 修改：`src/channels/lark/delivery.rs`
+- 修改：`src/channels/lark/mod.rs`
+- 测试：`src/channels/lark/tests.rs`
 
 **Step 1：定义内部出站请求结构体**
 
-字段：
+结果：已完成。
 
-- target
-- text
-- card
-- media inputs
-- file name
-- reply_to_message_id
-- reply_in_thread
-- account_id
+说明：
+
+- `LarkOutboundRequest` 作为统一内部出站规范化入口保留
+- target / text / card / 本地附件 / 远程附件 / unresolved marker / reply 目标已经统一进入该结构
 
 **Step 2：重构当前 `Channel::send` 逻辑，先构建出站请求**
 
-目标：
+结果：已完成。
 
-- 保留当前 marker 支持
-- 所有发送行为都先走统一规范化函数
+说明：
+
+- `Channel::send` 先构建 `LarkOutboundRequest`
+- 保留当前 marker / path-only / remote attachment 行为
+- card / text / attachment 全部共享同一套目标归一化和 reply 路径
 
 **Step 3：为请求规范化补测试**
 
-测试：
+结果：已完成，并新增官方行为回归测试。
 
-- text only
-- text + image marker
-- path-only image
-- text + file marker
-- unresolved marker fallback
+新增覆盖：
+
+- prefixed target normalization
+- raw JSON card detect
+- wrapped interactive card detect
+- text body emits `post`
+- `open_id` target send
+- `chat:` target send
+- raw JSON card send
+- official `send` text aliases
+- same-chat reply/thread inheritance
+- explicit `replyTo` override
+- media `path` / `name` aliases
+- media upload failure fallback
 
 **Step 4：验证**
 
 运行：
 
 ```bash
-cargo test lark_parse_attachment_ --lib
+cargo test lark_outbound_request_normalizes_prefixed_targets_like_official_plugin --lib
+cargo test lark_parse_card_message_from_raw_json_text --lib
+cargo test lark_build_text_message_body_uses_post_payload_like_official_plugin --lib
+cargo test lark_send_text_to_open_id_target_uses_open_id_receive_id_type_and_post_payload --lib
+cargo test lark_send_text_to_chat_prefixed_target_uses_chat_id_receive_id_type --lib
+cargo test lark_send_raw_card_json_routes_to_interactive_message_like_official_plugin --lib
+cargo build
 ```
 
 ### Phase 1.6: Target / Reply / Thread Normalization
 
-状态：进行中，`thread_ts` 现在已经能流入原生 Lark reply-in-thread 发送行为，不再在 channel 边界被忽略。
+状态：已完成本阶段目标。当前实现已覆盖官方 `actions.js` / `targets.js` 在本阶段要求的 target 归一化、reply/thread 继承，以及具名 Feishu 账号从当前 channel 上下文继承的发送路径。
 
 **文件：**
 
@@ -712,6 +789,16 @@ cargo test lark_parse_attachment_ --lib
 - thread reply send
 - named Feishu account reply path
 
+已补并验证：
+
+- prefixed target normalization（`chat:` / `user:` / `open_id:` / `feishu:`）
+- official `to` / `message` alias send path
+- omitted target inherits current chat + thread reply context
+- same-chat alias target inherits thread reply context
+- explicit `replyTo` overrides inherited current message id
+- different target does not inherit current thread reply context
+- named Feishu account inferred from `__channel_context.current_channel_name`
+
 **Step 4：验证**
 
 运行：
@@ -722,13 +809,21 @@ cargo test lark_build_ --lib
 
 ### Phase 1.7: Outbound Media Source Normalization
 
-状态：进行中，marker 解析现在已接受 `file://` 与远程 `http(s)` 附件，并在发送前将它们物化为可上传本地文件。
+状态：功能目标已基本完成，但不是与 `openclaw` 100% 同实现，当前还不能标记为“与官方完全功能一致”。当前实现已覆盖本阶段要求的 `absolute path` / `file://` / `http(s)` 输入、包装符剥离、`MEDIA:` 前缀兼容、远程下载上传前物化，以及无效 scheme / 相对路径拒绝行为；同时补上了远程媒体大小上限与基础 SSRF/IP 拦截。Feishu 工具侧与 Lark/Feishu channel 侧现已把上层宿主的媒体 load policy 真实下传到底层共享 loader：显式 `media/path/filePath/url` / channel 远程附件物化都会读取账号配置里的 `media_max_mb` / `media_local_roots`，`local_pick` 走 root-scoped sandbox validated reader，并有回归测试覆盖当前 channel inbound cache 命中、workspace fallback，以及 symlink 越权阻断。
+
+与 `openclaw` 仍存在的实现差异：
+
+- 我们已把 Feishu tool / Lark channel 的媒体加载入口统一到共享 load helper，并补上 `sandboxValidated`、`any roots + reader override`、root-scoped reader / sandbox options builder；Feishu tool 与 Lark channel 宿主入口都已支持账号级 `media_max_mb` / `media_local_roots` 下传，但还没有官方那种更广义、跨宿主统一的完整传播链。
+- 我们的 SSRF 防护已升级为可注入 policy 结构，不再是单纯写死判断；但还没有官方那种更完整的策略对象传播链与远程解析约束。
+- 我们的默认本地允许目录策略已收敛为 `workspace_dir` / 系统临时目录 / `~/.zeroclaw/workspace`，比之前更接近官方；但工具侧仍额外保留了“显式绝对路径直发”的兼容通道，以避免破坏现有 ZeroClaw 使用方式。
 
 **文件：**
 
-- 修改：`src/channels/lark.rs`
-- 修改：`src/channels/lark_media.rs`
-- 测试：`src/channels/lark.rs`
+- 修改：`src/channels/lark/media_source.rs`
+- 修改：`src/channels/lark/media.rs`
+- 修改：`src/tools/feishu/im_message_send.rs`
+- 测试：`src/channels/lark/tests.rs`
+- 测试：`src/tools/feishu/im_message_tests.rs`
 
 **Step 1：增加媒体输入变体**
 
@@ -762,6 +857,22 @@ cargo test lark_build_ --lib
 - remote URL media
 - invalid URL / unsupported scheme
 
+已补并验证：
+
+- wrapped remote URL input（尖括号 / 引号 / 反引号包装）
+- `MEDIA:`-prefixed remote URL input
+- explicit absolute local path send
+- `file://` local URL send
+- Feishu 账号配置 `media_max_mb` 会约束远程媒体拉取大小
+- Feishu 账号配置 `media_local_roots` 会限制显式本地路径发送范围
+- Lark/Feishu channel 远程附件物化同样会读取 `media_max_mb` / `media_local_roots`
+- `local_pick` 优先当前 channel inbound cache，随后回退 workspace root
+- `local_pick` 命中 symlink 逃逸文件时拒绝发送，证明 root-scoped reader 生效
+- relative local path reject
+- unsupported URL scheme reject
+- oversized remote media reject
+- media upload failure returns error
+
 **Step 5：验证**
 
 运行：
@@ -772,7 +883,7 @@ cargo test channels::lark::tests:: --lib
 
 ### Phase 1.8: Outbound Media Message Types
 
-状态：进行中，出站附件分类现在已覆盖 image/file/audio/video，并将 video 映射为 `media`、audio 映射为 `audio` 消息类型。
+状态：已完成本阶段目标。当前实现已覆盖 image/file/audio/video 四类出站媒体消息类型，并补齐 audio/video 的 file type 映射与 duration 上传字段行为。
 
 **文件：**
 
@@ -804,6 +915,14 @@ cargo test channels::lark::tests:: --lib
 - image payload uses `image_key`
 - file payload uses `file_key`
 - audio/video classification routes correctly
+
+已补并验证：
+
+- image payload -> `msg_type=image` + `image_key`
+- file payload -> `msg_type=file` + `file_key`
+- `.ogg/.opus` -> upload `file_type=opus`，发送 `msg_type=audio`
+- `.mp4/.mov/.avi/.mkv/.webm` -> upload `file_type=mp4`，发送 `msg_type=media`
+- audio/video upload request includes derived `duration`
 
 **Step 4：验证**
 

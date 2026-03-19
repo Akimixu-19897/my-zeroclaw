@@ -1,9 +1,14 @@
 use super::common::{annotate_feishu_tool_error, FeishuToolClient};
+#[path = "im_message_send.rs"]
+mod send;
+
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+
+const CHANNEL_CONTEXT_ARG_KEY: &str = "__channel_context";
 
 pub struct FeishuImMessageTool {
     config: Arc<Config>,
@@ -31,6 +36,25 @@ impl FeishuImMessageTool {
             None => client,
         })
     }
+
+    fn infer_account<'a>(&self, args: &'a serde_json::Value) -> Option<&'a str> {
+        args.get("account")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                args.get(CHANNEL_CONTEXT_ARG_KEY)
+                    .and_then(|context| context.get("current_channel_name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| {
+                        *value == "feishu"
+                            || value.starts_with("feishu:")
+                            || *value == "lark"
+                            || value.starts_with("lark:")
+                    })
+            })
+    }
 }
 
 #[async_trait]
@@ -40,7 +64,17 @@ impl Tool for FeishuImMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send, reply to, update, or delete Feishu IM messages with configured bot accounts."
+        "Send, reply to, update, or delete Feishu IM messages with configured bot accounts. \
+         For current-chat delivery, prefer one direct send with `media`/`path` or `text`; do not \
+         use search/list/glob tools first when the exact file path or URL is already known. If the \
+         user only asked for any local test image/file, prefer `local_pick=image` or `local_pick=file` \
+         to reuse the current chat cache/workspace in one call. If you already created or know an \
+         exact local media path, send it with this tool and do not paste the path back as plain text. \
+         Audio/video files are supported through the same `media`/`path` input. For Feishu voice-style \
+         delivery, audio should be generated and saved as `.ogg` or `.opus` before sending; do not use \
+         `mp3` or `m4a` when the intent is a voice message. When this tool successfully delivers into \
+         the current Feishu chat, finish the turn with exactly `NO_REPLY` to avoid duplicate follow-up \
+         messages or repeated sends."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -49,7 +83,7 @@ impl Tool for FeishuImMessageTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["send_text", "reply_text", "update_text", "delete_message"],
+                    "enum": ["send", "send_text", "reply_text", "update_text", "delete_message"],
                     "description": "IM message operation to perform"
                 },
                 "account": {
@@ -58,7 +92,7 @@ impl Tool for FeishuImMessageTool {
                 },
                 "receive_id": {
                     "type": "string",
-                    "description": "Target chat ID for send_text"
+                    "description": "Target Feishu chat/user ID for send or send_text"
                 },
                 "message_id": {
                     "type": "string",
@@ -67,9 +101,68 @@ impl Tool for FeishuImMessageTool {
                 "text": {
                     "type": "string",
                     "description": "Text content to send, reply with, or update into the target message"
-                }
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Alias of text for unified send"
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Alias of receive_id for unified send"
+                },
+                "media": {
+                    "type": "string",
+                    "description": "Media URL or exact local absolute path for unified send. Prefer passing the known path directly instead of rediscovering it with search/list/glob tools. For voice-style Feishu audio, prefer `.ogg` or `.opus` files."
+                },
+                "local_pick": {
+                    "type": "string",
+                    "enum": ["image", "file"],
+                    "description": "When no exact path is known, pick one suitable local attachment automatically. Search current channel inbound cache first, then fall back to the workspace root."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Alias of media for unified send"
+                },
+                "filePath": {
+                    "type": "string",
+                    "description": "Alias of media for unified send"
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Alias of media for unified send"
+                },
+                "fileName": {
+                    "type": "string",
+                    "description": "Optional upload file name override"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Alias of fileName for unified send"
+                },
+                "replyTo": {
+                    "type": "string",
+                    "description": "Optional message ID to reply to in unified send"
+                },
+                "card": {
+                    "description": "Interactive card object or JSON string for unified send"
+                },
             },
-            "required": ["action"]
+            "required": ["action"],
+            "examples": [
+                {
+                    "action": "send",
+                    "media": "/absolute/path/to/image.png"
+                },
+                {
+                    "action": "send",
+                    "message": "这里是报告",
+                    "media": "/absolute/path/to/report.pdf"
+                },
+                {
+                    "action": "send",
+                    "media": "/absolute/path/to/voice.ogg"
+                }
+            ]
         })
     }
 
@@ -79,34 +172,18 @@ impl Tool for FeishuImMessageTool {
                 .get("action")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
-            let account = args.get("account").and_then(serde_json::Value::as_str);
+            let account = self.infer_account(&args);
             let client = self.build_client(account)?;
 
             let output = match action {
-                "send_text" => {
-                    let receive_id = args
-                        .get("receive_id")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Missing 'receive_id' parameter"))?;
-                    let text = args
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Missing 'text' parameter"))?;
-                    let response = client
-                        .post_json(
-                            "/im/v1/messages?receive_id_type=chat_id",
-                            &json!({
-                                "receive_id": receive_id,
-                                "msg_type": "text",
-                                "content": json!({ "text": text }).to_string(),
-                            }),
-                        )
-                        .await?;
-                    json!({
-                        "account": client.account_name(),
-                        "action": action,
-                        "message_id": response.pointer("/data/message_id"),
-                    })
+                "send" | "send_text" => {
+                    send::deliver_feishu_send_action(
+                        &client,
+                        &args,
+                        action,
+                        self.config.workspace_dir.as_path(),
+                    )
+                    .await?
                 }
                 "reply_text" => {
                     let message_id = args
@@ -121,8 +198,8 @@ impl Tool for FeishuImMessageTool {
                         .post_json(
                             &format!("/im/v1/messages/{message_id}/reply"),
                             &json!({
-                                "msg_type": "text",
-                                "content": json!({ "text": text }).to_string(),
+                                "msg_type": "post",
+                                "content": crate::channels::lark::message_builders::build_lark_post_content(text).to_string(),
                             }),
                         )
                         .await?;
@@ -145,8 +222,8 @@ impl Tool for FeishuImMessageTool {
                         .patch_json(
                             &format!("/im/v1/messages/{message_id}"),
                             &json!({
-                                "msg_type": "text",
-                                "content": json!({ "text": text }).to_string(),
+                                "msg_type": "post",
+                                "content": crate::channels::lark::message_builders::build_lark_post_content(text).to_string(),
                             }),
                         )
                         .await?;
@@ -186,99 +263,5 @@ impl Tool for FeishuImMessageTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::schema::LarkReceiveMode;
-    use crate::config::{ChannelsConfig, FeishuConfig};
-    use wiremock::matchers::{body_json, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn test_config() -> Arc<Config> {
-        Arc::new(Config {
-            channels_config: ChannelsConfig {
-                feishu: Some(FeishuConfig {
-                    app_id: "cli_test_app".to_string(),
-                    app_secret: "secret".to_string(),
-                    enabled: None,
-                    encrypt_key: None,
-                    verification_token: None,
-                    allowed_users: vec!["*".to_string()],
-                    receive_mode: LarkReceiveMode::default(),
-                    port: None,
-                }),
-                ..ChannelsConfig::default()
-            },
-            ..Config::default()
-        })
-    }
-
-    async fn mock_token(server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/auth/v3/tenant_access_token/internal"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "code": 0,
-                "tenant_access_token": "tenant_token"
-            })))
-            .mount(server)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn send_text_posts_message_with_chat_receive_id() {
-        let server = MockServer::start().await;
-        mock_token(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
-            .and(body_json(json!({
-                "receive_id": "oc_chat_1",
-                "msg_type": "text",
-                "content": "{\"text\":\"hello\"}"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "code": 0,
-                "data": { "message_id": "om_123" }
-            })))
-            .mount(&server)
-            .await;
-
-        let tool = FeishuImMessageTool::new(test_config()).with_api_base_for_test(server.uri());
-        let result = tool
-            .execute(json!({
-                "action": "send_text",
-                "receive_id": "oc_chat_1",
-                "text": "hello"
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("\"message_id\": \"om_123\""));
-    }
-
-    #[tokio::test]
-    async fn delete_message_calls_delete_endpoint() {
-        let server = MockServer::start().await;
-        mock_token(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path("/im/v1/messages/om_123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "code": 0,
-                "data": {}
-            })))
-            .mount(&server)
-            .await;
-
-        let tool = FeishuImMessageTool::new(test_config()).with_api_base_for_test(server.uri());
-        let result = tool
-            .execute(json!({
-                "action": "delete_message",
-                "message_id": "om_123"
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("\"deleted\": true"));
-    }
-}
+#[path = "im_message_tests.rs"]
+mod tests;

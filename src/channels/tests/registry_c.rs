@@ -93,6 +93,52 @@ fn wecom_does_not_thread_tool_updates_via_message_id() {
 }
 
 #[test]
+fn feishu_and_lark_do_not_thread_tool_updates_via_message_id() {
+    assert!(!should_forward_tool_events_as_thread_messages("feishu"));
+    assert!(!should_forward_tool_events_as_thread_messages(
+        "feishu:primary"
+    ));
+    assert!(!should_forward_tool_events_as_thread_messages("lark"));
+    assert!(!should_forward_tool_events_as_thread_messages("lark:primary"));
+
+    let msg = traits::ChannelMessage {
+        id: "feishu-msg-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "user:alice".to_string(),
+        content: "send an image".to_string(),
+        channel: "feishu".to_string(),
+        timestamp: 1,
+        thread_ts: Some("omt-original".to_string()),
+        context: None,
+    };
+
+    assert_eq!(
+        final_reply_thread_ts_after_tool_updates(&msg, true).as_deref(),
+        None
+    );
+
+    let named_msg = traits::ChannelMessage {
+        channel: "feishu:primary".to_string(),
+        ..msg.clone()
+    };
+
+    assert_eq!(
+        final_reply_thread_ts_after_tool_updates(&named_msg, true).as_deref(),
+        None
+    );
+
+    let lark_msg = traits::ChannelMessage {
+        channel: "lark:primary".to_string(),
+        ..msg
+    };
+
+    assert_eq!(
+        final_reply_thread_ts_after_tool_updates(&lark_msg, false).as_deref(),
+        None
+    );
+}
+
+#[test]
 fn slack_keeps_tool_update_threading_via_message_id() {
     assert!(should_forward_tool_events_as_thread_messages("slack"));
 

@@ -10,6 +10,7 @@ pub(super) struct RecordingChannel {
 #[derive(Default)]
 pub(super) struct RecordingFeishuChannel {
     pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
+    pub(super) sent_threads: tokio::sync::Mutex<Vec<Option<String>>>,
 }
 
 #[derive(Default)]
@@ -118,6 +119,7 @@ impl Channel for RecordingFeishuChannel {
             .lock()
             .await
             .push(format!("{}:{}", message.recipient, message.content));
+        self.sent_threads.lock().await.push(message.thread_ts.clone());
         Ok(())
     }
 

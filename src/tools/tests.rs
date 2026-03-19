@@ -127,6 +127,8 @@ fn all_tools_includes_feishu_tools_when_feishu_is_configured() {
         allowed_users: vec!["*".into()],
         receive_mode: crate::config::schema::LarkReceiveMode::default(),
         port: None,
+        media_max_mb: None,
+        media_local_roots: Vec::new(),
     });
 
     let tools = all_tools(

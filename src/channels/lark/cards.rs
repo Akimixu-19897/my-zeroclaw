@@ -37,9 +37,10 @@ impl LarkCardMessage {
 
 pub(crate) fn parse_lark_card_message(raw_content: &str) -> Option<LarkCardMessage> {
     let trimmed = raw_content.trim();
-    let body = extract_fenced_block(trimmed, "lark-card")
-        .or_else(|| extract_fenced_block(trimmed, "feishu-card"))?;
-    let content = serde_json::from_str::<Value>(body).ok()?;
+    let content = extract_fenced_block(trimmed, "lark-card")
+        .or_else(|| extract_fenced_block(trimmed, "feishu-card"))
+        .and_then(parse_lark_card_json)
+        .or_else(|| parse_lark_card_json(trimmed))?;
     Some(LarkCardMessage::new(content))
 }
 
@@ -261,4 +262,48 @@ fn extract_fenced_block<'a>(content: &'a str, language: &str) -> Option<&'a str>
         .strip_prefix('\n')
         .or_else(|| body.strip_prefix("\r\n"))?;
     body.strip_suffix("```").map(str::trim)
+}
+
+fn parse_lark_card_json(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+
+    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    let Value::Object(obj) = parsed else {
+        return None;
+    };
+
+    if obj.get("schema").and_then(Value::as_str) == Some("2.0") {
+        return Some(Value::Object(obj));
+    }
+
+    if obj.get("elements").is_some() {
+        return Some(Value::Object(obj));
+    }
+
+    if obj.get("type").and_then(Value::as_str) == Some("template")
+        && obj
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| data.get("template_id"))
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        return Some(Value::Object(obj));
+    }
+
+    if matches!(
+        obj.get("msg_type").and_then(Value::as_str),
+        Some("interactive")
+    ) || matches!(obj.get("type").and_then(Value::as_str), Some("interactive"))
+    {
+        return obj.get("card").cloned().and_then(|card| match card {
+            Value::Object(_) => Some(card),
+            _ => None,
+        });
+    }
+
+    None
 }

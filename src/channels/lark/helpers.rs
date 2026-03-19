@@ -208,16 +208,24 @@ pub(super) struct ParsedPostContent {
     pub(super) mentioned_open_ids: Vec<String>,
 }
 
-pub(super) fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let locale = parsed
+fn unwrap_post_locale<'a>(parsed: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    if parsed.get("title").is_some() || parsed.get("content").is_some() {
+        return Some(parsed);
+    }
+
+    parsed
         .get("zh_cn")
         .or_else(|| parsed.get("en_us"))
         .or_else(|| {
             parsed
                 .as_object()
                 .and_then(|m| m.values().find(|v| v.is_object()))
-        })?;
+        })
+}
+
+pub(super) fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let locale = unwrap_post_locale(&parsed)?;
 
     let mut text = String::new();
     let mut normalized_lines = Vec::new();

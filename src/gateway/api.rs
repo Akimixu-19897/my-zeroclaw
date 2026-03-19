@@ -1075,6 +1075,8 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         cfg.channels_config.feishu_accounts.insert(
             "ops".to_string(),
@@ -1087,6 +1089,8 @@ mod tests {
                 allowed_users: vec!["*".to_string()],
                 receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
         cfg.channels_config.wecom = Some(crate::config::schema::WeComConfig {
@@ -1277,6 +1281,8 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
         current.channels_config.feishu_accounts.insert(
             "ops".to_string(),
@@ -1289,6 +1295,8 @@ mod tests {
                 allowed_users: vec!["*".to_string()],
                 receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
         current.channels_config.wecom = Some(crate::config::schema::WeComConfig {

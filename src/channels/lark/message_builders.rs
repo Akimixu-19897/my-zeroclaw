@@ -1,8 +1,10 @@
+use crate::channels::normalize_channel_markdown_text;
+
 pub(crate) fn build_lark_text_message_body(recipient: &str, content: &str) -> serde_json::Value {
     serde_json::json!({
         "receive_id": recipient,
-        "msg_type": "text",
-        "content": serde_json::json!({ "text": content }).to_string(),
+        "msg_type": "post",
+        "content": build_lark_post_content(content).to_string(),
     })
 }
 
@@ -47,5 +49,17 @@ pub(crate) fn build_lark_reply_message_body(
         "msg_type": msg_type,
         "content": content.to_string(),
         "reply_in_thread": reply_in_thread,
+    })
+}
+
+pub(crate) fn build_lark_post_content(content: &str) -> serde_json::Value {
+    let normalized = normalize_channel_markdown_text(content);
+    serde_json::json!({
+        "zh_cn": {
+            "content": [[{
+                "tag": "md",
+                "text": normalized,
+            }]]
+        }
     })
 }

@@ -199,6 +199,8 @@ fn resolve_feishu_targets(
                     allowed_users: lark.allowed_users.clone(),
                     receive_mode: lark.receive_mode.clone(),
                     port: lark.port,
+                    media_max_mb: lark.media_max_mb,
+                    media_local_roots: lark.media_local_roots.clone(),
                 },
             }]);
         }
@@ -249,6 +251,8 @@ fn collect_all_feishu_targets(config: &Config) -> Vec<FeishuDiagnosticTarget> {
                     allowed_users: lark.allowed_users.clone(),
                     receive_mode: lark.receive_mode.clone(),
                     port: lark.port,
+                    media_max_mb: lark.media_max_mb,
+                    media_local_roots: lark.media_local_roots.clone(),
                 },
             });
         }
@@ -295,6 +299,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         for alias in ["default", "feishu"] {
@@ -329,6 +335,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(8080),
+            media_max_mb: None,
+            media_local_roots: Vec::new(),
         });
 
         let report = collect_feishu_diagnostics(&config, None).expect("report");
@@ -354,6 +362,8 @@ mod tests {
                 allowed_users: vec!["ou_ops".into()],
                 receive_mode: LarkReceiveMode::Webhook,
                 port: Some(8081),
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 
@@ -381,6 +391,8 @@ mod tests {
                 allowed_users: vec!["ou_ops".into()],
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
+                media_max_mb: None,
+                media_local_roots: Vec::new(),
             },
         );
 

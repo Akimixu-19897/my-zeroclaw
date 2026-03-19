@@ -121,21 +121,18 @@ pub(crate) fn parse_lark_attachment_markers(message: &str) -> (String, Vec<LarkA
 
 pub(crate) fn classify_lark_outgoing_attachments(
     attachments: &[LarkAttachment],
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
-    let mut local_images = Vec::new();
-    let mut local_documents = Vec::new();
+) -> (Vec<LarkAttachment>, Vec<String>) {
+    let mut local_attachments = Vec::new();
     let mut unresolved_markers = Vec::new();
 
     for attachment in attachments {
         let target = attachment.target.trim();
         let path = Path::new(target);
         if path.exists() && path.is_file() {
-            match attachment.kind {
-                LarkAttachmentKind::Image => local_images.push(path.to_path_buf()),
-                LarkAttachmentKind::Document
-                | LarkAttachmentKind::Audio
-                | LarkAttachmentKind::Video => local_documents.push(path.to_path_buf()),
-            }
+            local_attachments.push(LarkAttachment {
+                kind: attachment.kind,
+                target: target.to_string(),
+            });
             continue;
         }
 
@@ -147,5 +144,5 @@ pub(crate) fn classify_lark_outgoing_attachments(
         });
     }
 
-    (local_images, local_documents, unresolved_markers)
+    (local_attachments, unresolved_markers)
 }
